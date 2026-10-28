@@ -111,8 +111,9 @@ A dashboard filter card becomes an Excel control where the card was, with Tablea
 | Multiple values (dropdown, list) of a field (Region, YEAR(Order Date) …) | a **slicer** |
 | Single value (dropdown, list, slider) | a **dropdown cell** (Data Validation list: (All) and the field's values) |
 | Range of dates (slider, range of dates) | **From** / **To** date cells (only dates within the data's) |
+| Start / End date parameters that a calculated filter compares a date with (`[Order Date] >= [Start Date] AND [Order Date] <= [End Date]`, also inside `IF … THEN TRUE ELSE FALSE END`) | each parameter's **Year / Month / Day dropdowns** (Excel has no pop-up calendar without macros) and the date they make – the visuals follow it; a day past the month's end is its last day |
 
-Relative-date filters and ranges of measures (they filter marks, not rows) stay text cards.
+A dropdown or date range filters only the visuals Tableau filters by it: such a visual reads its own `Visible: <sheet>` column. Relative-date filters and ranges of measures (they filter marks, not rows) stay text cards.
 
 1. The data source's rows (one logical table, up to `slicerMaxRows`) go to a hidden **Slicer Data** sheet as an Excel table: a `Visible` column (`SUBTOTAL(103)` – 0 on a row the slicers hide – and 0 as well when a dropdown cell or the From / To cells leave the row out; the dropdowns' lists are on a hidden **Slicer Lists** sheet), the slicer fields, the measure fields the formulas need, and per visual a key column – the mark each row belongs to, found by the visual's dimensions under the sheet's other filters (a date range, a categorical filter).
 2. Each measure becomes a formula over the visible rows of its mark: `SUMIFS`, `AVERAGEIFS`, `MINIFS`, `MAXIFS`, `COUNTIFS`, a distinct count (`UNIQUE` / `FILTER`, Excel 2021 / 365), or a calculation of those (`SUM([Profit])/SUM([Sales])`). Chart values (`tvSum` keeps each value's marks), table cells and KPI values are written as these formulas, with Tableau's number as the cached result; a mark the slicers leave empty is a gap in a chart (`#N/A`) and a blank cell in a table.

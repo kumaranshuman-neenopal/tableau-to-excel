@@ -1808,7 +1808,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 7;
+const FORMAT_MODEL_VERSION = 8;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -1898,6 +1898,8 @@ function parseTableauFormatting(xmlString) {
     ].filter(x => x.field && x.measure) : [];
     // members kept by the Measure Names filter, in filter order
     sheet.measureFilter = [];
+    // the fields the sheet filters by (a calculated filter's own datasource: two calculations can share a caption)
+    sheet.filterRefs = view ? tfKids(view, "filter").map(f => tfParseFieldRef(f.getAttribute("column") || "")).filter(Boolean) : [];
     if (view) tfKids(view, "filter").forEach(f => {
       if (!/\[:Measure Names\]$/.test(f.getAttribute("column") || "")) return;
       Array.from(f.getElementsByTagName("groupfilter")).forEach(g => {
@@ -12085,6 +12087,26 @@ const SLICER_DATA_SHEET = "Slicer Data";
 const SLICER_LISTS_SHEET = "Slicer Lists";                       // the dropdown cells' lists of values
 const SLICER_TABLE = "SlicerData";
 const SLICER_ALL = "(All)";
+
+/**
+ * A calculated filter that keeps the dates between two date parameters – Tableau's usual "Start Date / End Date"
+ * pattern: [Order Date] >= [Parameters].[Start] AND [Order Date] <= [Parameters].[End] (also inside IF … THEN TRUE
+ * ELSE FALSE END). Returns the date field, the parameters and whether each bound is strict; null for anything else.
+ * @param {string} formula
+ */
+function slicerParamRange(formula) {
+  let f = String(formula || "").replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ").trim();
+  const wrapped = f.match(/^IF (.+?) THEN TRUE ELSE FALSE END$/i);
+  if (wrapped) f = wrapped[1];
+  const cmp = "\\(?\\s*\\[([^\\]]+)\\]\\s*(>=|>|<=|<)\\s*\\[Parameters\\]\\.\\[([^\\]]+)\\]\\s*\\)?";
+  const m = f.match(new RegExp(`^\\(?\\s*${cmp}\\s+AND\\s+${cmp}\\s*\\)?$`, "i"));
+  if (!m) return null;
+  const a = { date: m[1], op: m[2], param: m[3] }, b = { date: m[4], op: m[5], param: m[6] };
+  if (a.date.toLowerCase() !== b.date.toLowerCase()) return null;
+  const lo = [a, b].find(x => x.op[0] === ">"), hi = [a, b].find(x => x.op[0] === "<");
+  if (!lo || !hi) return null;
+  return { date: a.date, lo: lo.param, hi: hi.param, loStrict: lo.op === ">", hiStrict: hi.op === "<" };
+}
 /* a slicer as Excel draws it (default style): its caption, its buttons, a little padding; px */
 const SLICER_HEADER_PX = 34, SLICER_ITEM_PX = 26, SLICER_PAD_PX = 10, SLICER_ITEM_MIN_W_PX = 90, SLICER_MAX_ITEM_ROWS = 8;
 /** TWB derivations of a date a slicer key can be built from (YEAR, QUARTER, MONTH, DAY, and their truncated forms) */
@@ -12342,6 +12364,8 @@ function createSlicerModel() {
   const visible = r => fields.every(f => f.pass(r));
   const shownBySlicers = r => fields.every(f => f.kind !== "slicer" || f.pass(r));     // the rows the table's filter hides
   let lists = 0;                            // dropdown fields: one column each on the lists sheet
+  /** other dropdowns' lists (a date's year / month / day) on the lists sheet @type {{ col: number, values: any[] }[]} */
+  const extraLists = [];
 
   /** the table column of a source column (written the first time a formula needs it) */
   const fieldColumn = col => {
@@ -12355,8 +12379,59 @@ function createSlicerModel() {
     return /** @type {number} */ (fieldCols.get(col));
   };
 
+  /**
+   * The days of source column col kept between two bounds → a "range" field (loDv / hiDv: DataValues of its bounds,
+   * missing = the data's first / last day); a reason (string) when the column has no dates. opts: includeNull,
+   * loStrict / hiStrict (> / < instead of >= / <=), calc (the calculated filter it stands for).
+   */
+  const rangeField = (col, name, loDv, hiDv, opts) => {
+    // the days of the rows (a date at midnight may arrive in local time: its nearest day; a date-time: its day)
+    const timed = /time/.test(/** @type {SlicerSource} */ (source).columns[col].dataType);
+    const day = dv => { const s = !dv || tfIsNull(dv) ? null : tvExcelSerial(dv); return s === null ? null : timed ? Math.floor(s + 1e-9) : Math.round(s); };
+    const serials = /** @type {SlicerSource} */ (source).rows.map(r => day(r[col]));
+    let min = Infinity, max = -Infinity;
+    serials.forEach(s => { if (s !== null) { if (s < min) min = s; if (s > max) max = s; } });
+    if (min === Infinity) return "has no dates in the data source";
+    const lo = day(loDv) ?? min, hi = day(hiDv) ?? max;
+    const above = opts.loStrict ? v => v > lo : v => v >= lo, below = opts.hiStrict ? v => v < hi : v => v <= hi;
+    /** @type {any} */
+    const field = { kind: "range", col, deriv: "none", isDate: true, header: uniqueHeader(name), values: serials, items: [], selected: null,
+                    tableCol: -1, lo, hi, min, max, includeNull: !!opts.includeNull, loStrict: !!opts.loStrict, hiStrict: !!opts.hiStrict,
+                    calc: opts.calc || null, control: null,
+                    pass: r => serials[r] === null ? field.includeNull : above(serials[r]) && below(serials[r]) };
+    columns.push({ header: field.header, values: serials, date: true });
+    field.tableCol = columns.length + 1;
+    fields.push(field);
+    return field;
+  };
+
+  /** a control field's condition on table row R (a dropdown's value, a range's From / To – or its bounds when a card
+   * is not on the sheet) */
+  const condOf = (f, R) => {
+    const c = `${getExcelColumnName(f.tableCol)}${R}`;
+    if (f.kind === "list") return `OR(${f.control.cell}="${SLICER_ALL}",${c}=${f.control.cell})`;
+    const from = (f.control && f.control.from) || String(f.lo), to = (f.control && f.control.to) || String(f.hi);
+    return `IF(ISNUMBER(${c}),AND(OR(${from}="",${c}${f.loStrict ? ">" : ">="}${from}),OR(${to}="",${c}${f.hiStrict ? "<" : "<="}${to})),` +
+           `${f.includeNull ? "TRUE" : "FALSE"})`;
+  };
+  /** Visible on row R: SUBTOTAL(103) – 0 on a row the slicers hide – and 0 when one of these controls leaves the row out */
+  const visibleFormula = (R, controls) => {
+    const conds = controls.filter(f => f.kind === "list" ? f.control : true).map(f => condOf(f, R));
+    return conds.length ? `IF(AND(${conds.join(",")}),SUBTOTAL(103,A${R}),0)` : `SUBTOTAL(103,A${R})`;
+  };
+
   return {
     get active() { return fields.length > 0 && !!source; },
+
+    /** a dropdown's list of values on the lists sheet (the same values: the same list) → its range, for Data Validation
+     * @param {any[]} values */
+    listRef(values) {
+      const key = JSON.stringify(values);
+      let l = extraLists.find(x => x.key === key);
+      if (!l) { l = { key, col: lists++, values }; extraLists.push(l); }
+      const letter = getExcelColumnName(l.col);
+      return sheetRef(SLICER_LISTS_SHEET, `$${letter}$1:$${letter}$${values.length}`);
+    },
     get fields() { return fields; },
     get failure() { return failed; },
 
@@ -12389,27 +12464,14 @@ function createSlicerModel() {
       const isDate = /date/.test(source.columns[col].dataType);
       if (deriv !== "none" && !isDate) return `"${ref.name}" holds no dates`;
       if (isRange && !isDate) return `a range of "${ref.name}", which holds no dates`;
-      const known = fields.find(x => x.col === col && x.deriv === deriv && (x.kind === "range") === isRange);
+      const known = fields.find(x => x.col === col && x.deriv === deriv && (x.kind === "range") === isRange && !x.calc);
       if (known) return known;
       if (locked) return "visuals are already bound to the other slicers";
       if (isRange) {
-        // the days of the rows (a date at midnight may arrive in local time: its nearest day; a date-time: its day)
-        const timed = /time/.test(source.columns[col].dataType);
-        const day = dv => { const s = tfIsNull(dv) ? null : tvExcelSerial(dv); return s === null ? null : timed ? Math.floor(s + 1e-9) : Math.round(s); };
-        const serials = source.rows.map(r => day(r[col]));
-        let min = Infinity, max = -Infinity;
-        serials.forEach(s => { if (s !== null) { if (s < min) min = s; if (s > max) max = s; } });
-        if (min === Infinity) return `"${ref.name}" has no dates in the data source`;
-        const lo = f.minValue && !tfIsNull(f.minValue) ? day(f.minValue) : min, hi = f.maxValue && !tfIsNull(f.maxValue) ? day(f.maxValue) : max;
-        if (lo === null || hi === null) return "its range cannot be told";
-        const field = { kind: "range", col, deriv, isDate, header: "", values: serials, items: [], selected: null, tableCol: -1,
-                        lo, hi, min, max, includeNull: !!f.includeNullValues, control: null,
-                        pass: r => serials[r] === null ? field.includeNull : serials[r] >= lo && serials[r] <= hi };
-        field.header = uniqueHeader(card.filterName || card.visualName || source.columns[col].name);
-        columns.push({ header: field.header, values: serials, date: true });
-        field.tableCol = columns.length + 1;
-        fields.push(field);
-        console.log(`[Slicers] "${field.header}": dates ${lo}–${hi} of ${min}–${max} (From / To cells)`);
+        const field = rangeField(col, card.filterName || card.visualName || source.columns[col].name, f.minValue, f.maxValue,
+                                 { includeNull: !!f.includeNullValues });
+        if (typeof field === "string") return `"${ref.name}" ${field}`;
+        console.log(`[Slicers] "${field.header}": dates ${field.lo}–${field.hi} of ${field.min}–${field.max} (From / To cells)`);
         return field;
       }
       const values = source.rows.map(r => slicerRowText(r[col], deriv, isDate) ?? "");
@@ -12445,6 +12507,33 @@ function createSlicerModel() {
     },
 
     /**
+     * A calculated filter keeping a date between two date parameters (slicerParamRange) → a "range" field whose
+     * From / To are the parameters' cells on the dashboard. spec: { calc: the calculation's FieldRef, date: the date
+     * field's name, lo / hi: the parameters' current DataValues, loStrict / hiStrict }. Returns the field or a reason.
+     * @param {any} spec @param {any} ws a worksheet filtered by it @param {FormatModel} model
+     */
+    async adoptParamRange(spec, ws, model) {
+      if (failed) return failed;
+      if (!source) {
+        try { source = await readSlicerSource(ws, spec.date); }
+        catch (e) { failed = `the data source's rows could not be read: ${e.message}`; return failed; }
+      } else {
+        const ds = await slicerDataSourceOf(ws, spec.date);
+        if (!ds || ds.id !== source.id) return `another data source than "${source.name}" (slicers filter one data source)`;
+      }
+      const col = slicerColumnOf(source, model, /** @type {any} */ ({ name: spec.date, ds: spec.calc.ds, deriv: null }));
+      if (col < 0) return `"${spec.date}" is not a column of "${source.name}"`;
+      if (!/date/.test(source.columns[col].dataType)) return `"${spec.date}" holds no dates`;
+      const known = fields.find(x => x.calc && x.calc.name === spec.calc.name && (x.calc.ds || "") === (spec.calc.ds || ""));
+      if (known) return known;
+      if (locked) return "visuals are already bound to the other slicers";
+      const field = rangeField(col, source.columns[col].name, spec.lo, spec.hi, { calc: spec.calc, loStrict: spec.loStrict, hiStrict: spec.hiStrict });
+      if (typeof field === "string") return `"${spec.date}" ${field}`;
+      console.log(`[Slicers] "${field.header}": dates ${field.lo}–${field.hi} of ${field.min}–${field.max} (date parameters)`);
+      return field;
+    },
+
+    /**
      * Binds a visual to the slicers: its marks found in the source rows, each measure checked against Tableau's
      * numbers. Returns the binding (vm.slicerBinding) – or a reason (string) the visual keeps fixed values.
      * @param {ViewModel} vm @param {string} sheetName @param {any[]} filters the sheet's Tableau filters @param {FormatModel} model
@@ -12458,8 +12547,16 @@ function createSlicerModel() {
         const col = slicerColumnOf(src, model, ref);
         return { f, col, deriv, isDate: col >= 0 && /date/.test(src.columns[col].dataType) };
       });
-      const missing = fields.filter(fd => !resolved.some(x => x.col === fd.col && x.deriv === fd.deriv));
+      // which fields Tableau filters it by: a calculated date filter by the sheet's own filter list (its datasource:
+      // two calculations can share a caption)
+      const sheetFilters = ((model && model.sheets[sheetName]) || {}).filterRefs || [];
+      const applies = fd => fd.calc ? sheetFilters.some(r => r.name === fd.calc.name && (r.ds || "") === (fd.calc.ds || ""))
+        : resolved.some(x => x.col === fd.col && x.deriv === fd.deriv);
+      // a slicer filters every visual (it hides the table's rows); a dropdown or date range only those it applies to
+      const missing = fields.filter(fd => fd.kind === "slicer" && !applies(fd));
       if (missing.length) return `Tableau does not filter it by ${missing.map(m => m.header).join(", ")}`;
+      const own = fields.filter(fd => fd.kind !== "slicer" && applies(fd));
+      const shown = r => fields.every(fd => (fd.kind !== "slicer" && !own.includes(fd)) || fd.pass(r));
       // its dimensions → source columns: headers, and continuous dimensions such as a date axis (MONTH(Order Date));
       // the latitude / longitude Tableau generates follow the geographic fields
       const heads = [], colHeads = [];
@@ -12527,7 +12624,7 @@ function createSlicerModel() {
       });
       /** @type {Map<number, number[]>} the rows of each mark under Tableau's current selection */
       const rowsOf = new Map();
-      keys.forEach((k, r) => { if (k && visible(r)) { if (!rowsOf.has(k)) rowsOf.set(k, []); /** @type {number[]} */ (rowsOf.get(k)).push(r); } });
+      keys.forEach((k, r) => { if (k && shown(r)) { if (!rowsOf.has(k)) rowsOf.set(k, []); /** @type {number[]} */ (rowsOf.get(k)).push(r); } });
 
       // each measure: translated, then checked mark by mark against Tableau's value
       /** @type {Map<number, { expr: SlicerExpr } | { reason: string }>} */
@@ -12552,7 +12649,14 @@ function createSlicerModel() {
       locked = true;
 
       let keyCol = -1;
-      const R = { col: c => range(fieldColumn(c)), get key() { return range(keyCol); }, vis: range(1) };
+      // Visible – or, when a dropdown / date range does not apply to it, a Visible of its own (writeTable: c.vis)
+      const controls = fields.filter(fd => fd.kind !== "slicer");
+      let visCol = own.length === controls.length ? 1 : -1;
+      const R = { col: c => range(fieldColumn(c)), get key() { return range(keyCol); },
+                  get vis() {
+                    if (visCol < 0) { columns.push({ header: uniqueHeader(`Visible: ${sheetName}`), values: src.rows.map((_, r) => (shown(r) ? 1 : 0)), vis: own }); visCol = columns.length + 1; }
+                    return range(visCol);
+                  } };
       /**
        * The formula of a value made of these marks' measure ci; null when it cannot follow the slicers.
        * "chart": a mark the slicers leave empty is #N/A (no point, no bar); "cell": an empty cell.
@@ -12607,37 +12711,30 @@ function createSlicerModel() {
       const ws = workbook.addWorksheet(SLICER_DATA_SHEET, { state: "hidden" });
       const head = ["Row", "Visible", ...columns.map(c => c.header)];
       head.forEach((h, c) => { ws.getCell(1, c + 1).value = h; });
-      // the conditions of the dropdown / From–To cells (a card no dashboard shows leaves its field out)
-      const controls = fields.filter(f => f.kind !== "slicer" && f.control);
-      const visibleFormula = R => {
-        const conds = controls.map(f => {
-          const c = `${getExcelColumnName(f.tableCol)}${R}`;
-          if (f.kind === "list") return `OR(${f.control.cell}="${SLICER_ALL}",${c}=${f.control.cell})`;
-          const { from, to } = f.control;
-          return `IF(ISNUMBER(${c}),AND(OR(${from}="",${c}>=${from}),OR(${to}="",${c}<=${to})),${f.includeNull ? "TRUE" : "FALSE"})`;
-        });
-        return conds.length ? `IF(AND(${conds.join(",")}),SUBTOTAL(103,A${R}),0)` : `SUBTOTAL(103,A${R})`;
-      };
+      // the dropdown / From–To conditions (a dropdown no dashboard shows leaves its field out)
+      const controls = fields.filter(f => f.kind !== "slicer");
       const dates = columns.map(c => !!c.date);
       for (let r = 0; r < N(); r++) {
         const row = ws.getRow(r + 2);
         row.getCell(1).value = r + 1;
-        row.getCell(2).value = { formula: visibleFormula(r + 2), result: visible(r) ? 1 : 0 };
+        row.getCell(2).value = { formula: visibleFormula(r + 2, controls), result: visible(r) ? 1 : 0 };
         columns.forEach((c, k) => {
           if (c.values[r] === null || c.values[r] === undefined) return;
           const cell = row.getCell(k + 3);
-          cell.value = c.values[r];
+          cell.value = c.vis ? { formula: visibleFormula(r + 2, c.vis), result: c.values[r] } : c.values[r];
           if (dates[k]) cell.numFmt = "yyyy-mm-dd";
         });
         if (!shownBySlicers(r)) row.hidden = true;
       }
       ws.columns.forEach((col, c) => { col.width = c < 2 ? 8 : 16; });
       const listed = fields.filter(f => f.kind === "list");
-      if (listed.length) {
+      if (listed.length || extraLists.length) {
         const ls = workbook.addWorksheet(SLICER_LISTS_SHEET, { state: "hidden" });
         listed.forEach(f => f.choices.forEach((v, i) => { const cell = ls.getCell(i + 1, f.listCol + 1); cell.value = v; cell.numFmt = "@"; }));
+        extraLists.forEach(l => l.values.forEach((v, i) => { ls.getCell(i + 1, l.col + 1).value = v; }));
       }
-      return { sheetName: ws.name, ref: `A1:${getExcelColumnName(head.length - 1)}${N() + 1}`, headers: head, visibleFormula: visibleFormula(2) };
+      return { sheetName: ws.name, ref: `A1:${getExcelColumnName(head.length - 1)}${N() + 1}`, headers: head,
+               visibleFormula: visibleFormula(2, controls), columnFormulas: columns.map(c => (c.vis ? visibleFormula(2, c.vis) : null)) };
     },
 
     /** the package parts' plan for injectSlicers @param {any[]} placed slicers placed on the dashboard sheets */
@@ -12664,6 +12761,7 @@ function createSlicerModel() {
       fields.length = 0;
       columns.length = 0;
       lists = 0;
+      extraLists.length = 0;
       fieldCols.clear();
       headers.clear();
       headers.add("row").add("visible");
@@ -12697,6 +12795,69 @@ function bindPie(slicers, pie, sheetName, filters, model) {
   if (rows.some(r => !binding.formulaFor([r], pie.valueCol, "chart")))
     return binding.reasons[0] || `${pie.valueCaption}: its slices cannot be rebuilt from the data source's rows`;
   return binding;
+}
+
+const DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * A Start / End date parameter's control whose date a calculated filter compares (adoptParamRange): its title, Year /
+ * Month / Day dropdowns (the card's zone split in three columns: item.splitCuts), and the date they make – the cell
+ * the visuals follow, the From (or To) of each such range. A day past the month's end is its last day. Shown on
+ * another dashboard again, the card shows the first one's date.
+ * @param {import("exceljs").Worksheet} worksheet @param {any} item @param {any} tracker
+ * @param {ReturnType<typeof createSlicerModel>} slicers (its lists sheet holds the dropdowns' lists)
+ */
+function writeParamDateCard(worksheet, item, tracker, slicers) {
+  const first = item.paramFields[0];
+  const serial = first.end === "from" ? first.field.lo : first.field.hi;
+  const date = new Date(Math.round((serial - 25569) * 86400000));
+  const C = item.gridCol, W = Math.max(1, item.gridW), top = item.gridRow + 2;      // 1-based row of the dropdowns
+  writeIndividualFilterTable(worksheet, item.filterName, ["", date], item.gridRow, C, tracker, W);
+  const dateCell = worksheet.getCell(top + 1, C + 1);
+  dateCell.numFmt = "m/d/yyyy";
+  const abs = cell => { const m = String(cell.address).match(/^([A-Z]+)(\d+)$/); return `$${m[1]}$${m[2]}`; };
+  const owner = item.paramFields.map(pf => pf.field.control && pf.field.control[pf.end]).find(Boolean);
+  if (owner) {                                         // shown again: the first card's date
+    dateCell.value = { formula: owner, result: date };
+    worksheet.getCell(top, C + 1).value = "(set on the first dashboard)";
+    return;
+  }
+  // the three dropdowns: one per part of the split zone (or per column when the zone was not split)
+  const cuts = item.splitCuts && item.splitCuts.length === 2 ? item.splitCuts : W >= 3 ? [1, 2] : null;
+  if (cuts) {
+    const starts = [0, ...cuts], ends = [...cuts, W];
+    if (W > 1) { try { worksheet.unMergeCells(top, C + 1, top, C + W); } catch (e) { /* not merged */ } }
+    /** @type {Partial<import("exceljs").Border>} */
+    const edge = { style: "thin", color: { argb: "FFBFBFBF" } };
+    const y0 = Math.min(...item.paramFields.map(pf => pf.field.min)), y1 = Math.max(...item.paramFields.map(pf => pf.field.max));
+    const yearOf = s => new Date(Math.round((s - 25569) * 86400000)).getUTCFullYear();
+    const years = [];
+    for (let y = Math.min(yearOf(y0), date.getUTCFullYear()); y <= Math.max(yearOf(y1), date.getUTCFullYear()); y++) years.push(y);
+    const parts = [
+      { value: date.getUTCFullYear(), list: years, name: "year" },
+      { value: DATE_MONTHS[date.getUTCMonth()], list: DATE_MONTHS, name: "month" },
+      { value: date.getUTCDate(), list: Array.from({ length: 31 }, (_, i) => i + 1), name: "day" }
+    ];
+    const cells = parts.map((p, k) => {
+      const c0 = C + starts[k], c1 = C + Math.max(starts[k] + 1, ends[k]) - 1;
+      if (c1 > c0) { try { worksheet.mergeCells(top, c0 + 1, top, c1 + 1); } catch (e) { /* already merged */ } }
+      const cell = worksheet.getCell(top, c0 + 1);
+      cell.value = p.value;
+      cell.font = dateCell.font;
+      cell.alignment = { horizontal: "left", vertical: "middle" };
+      cell.border = { top: edge, left: edge, right: edge };
+      cell.dataValidation = { type: "list", allowBlank: true, formulae: [slicers.listRef(p.list)], showErrorMessage: true,
+                              errorTitle: item.filterName, error: `Pick a ${p.name} from the list.` };
+      return abs(cell);
+    });
+    const [y, m, d] = cells, mi = `MATCH(${m},{${DATE_MONTHS.map(x => `"${x}"`).join(",")}},0)`;
+    dateCell.value = { formula: `IF(OR(${y}="",${m}="",${d}=""),"",DATE(${y},${mi},MIN(${d},DAY(EOMONTH(DATE(${y},${mi},1),0)))))`, result: date };
+  } else {                                             // too narrow for three: the date typed in
+    dateCell.dataValidation = { type: "date", operator: "greaterThan", allowBlank: true, formulae: [new Date(Date.UTC(1900, 0, 1))],
+                                showErrorMessage: true, errorTitle: item.filterName, error: "A date, e.g. 1/1/2024." };
+  }
+  const ref = sheetRef(worksheet.name, abs(dateCell));
+  item.paramFields.forEach(pf => { pf.field.control = pf.field.control || {}; pf.field.control[pf.end] = ref; });
 }
 
 /**
@@ -12779,7 +12940,10 @@ async function injectSlicers(buffer, plan) {
   zip.file(`xl/tables/table${tableN}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<table xmlns="${NS_MAIN}" id="${tableId}" name="${SLICER_TABLE}" displayName="${SLICER_TABLE}" ref="${table.ref}" totalsRowShown="0">` +
     `<autoFilter ref="${table.ref}">${filterCols}</autoFilter><tableColumns count="${table.headers.length}">` +
-    table.headers.map((h, i) => `<tableColumn id="${i + 1}" name="${esc(h)}"${i === 1 ? `><calculatedColumnFormula>${esc(table.visibleFormula || "SUBTOTAL(103,A2)")}</calculatedColumnFormula></tableColumn>` : "/>"}`).join("") +
+    table.headers.map((h, i) => {
+      const f = i === 1 ? table.visibleFormula || "SUBTOTAL(103,A2)" : i > 1 && table.columnFormulas ? table.columnFormulas[i - 2] : null;
+      return `<tableColumn id="${i + 1}" name="${esc(h)}"${f ? `><calculatedColumnFormula>${esc(f)}</calculatedColumnFormula></tableColumn>` : "/>"}`;
+    }).join("") +
     `</tableColumns><tableStyleInfo name="TableStyleLight1" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/></table>`);
   ct = addOverride(ct, `xl/tables/table${tableN}.xml`, "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml");
   const tableRid = nextRelId(dataRels);
@@ -13348,7 +13512,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         used.add(control);
         filterValueItems.push({
           type: "filterValue", isParameter: true, name: param.name, visualName: param.name,
-          filterName: param.name, values: [value], layout: layoutMap.get(control.name), rowCount: 2
+          filterName: param.name, values: [value], layout: layoutMap.get(control.name), rowCount: 2, param
         });
       });
       if (params.length) console.log(`[Parameters] ${used.size} of ${params.length} parameters have a control on the dashboard`);
@@ -13395,7 +13559,39 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         card.slicer = { field, ...size };
         card.rowCount = Math.max(card.rowCount, Math.ceil(size.heightPx / EXCEL_ROW_PX));
       }
-      if (filterValueItems.some(it => it.slicer || it.control)) {
+      // Start / End date parameters a calculated filter keeps a date between (Date Flag: [Order Date] >= [Start Date]
+      // AND [Order Date] <= [End Date]): their cells become the range's From / To
+      const dateParams = filterValueItems.filter(it => it.isParameter && it.param && it.layout && /date/i.test(String(it.param.dataType || "")));
+      if (dateParams.length) {
+        // the parameter's control: by its id ([Parameters].[Parameter 1]), else by its caption
+        const paramCard = name => {
+          const id = tfNorm(`[Parameters].[${name}]`);
+          const info = fmtModel.fields["Parameters|" + String(name).toLowerCase()];
+          const names = [name, info && info.caption].filter(Boolean).map(tfNorm);
+          return dateParams.find(it => it.param.id && tfNorm(it.param.id) === id) ||
+                 dateParams.find(it => names.includes(tfNorm(it.param.name)));
+        };
+        const seen = new Set();
+        for (const item of dataWorksheetItems) {
+          for (const ref of ((fmtModel.sheets[item.name] || {}).filterRefs || [])) {
+            const key = `${ref.ds || ""}|${ref.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const info = tfFieldInfo(fmtModel, ref);
+            const spec = info && slicerParamRange(info.formulaFull || info.formula);
+            const lo = spec && paramCard(spec.lo), hi = spec && paramCard(spec.hi);
+            if (!spec || !lo || !hi) continue;
+            const ws = sheets.find(s => s.name === item.name);
+            const field = await slicers.adoptParamRange({ calc: ref, date: spec.date, lo: lo.param.currentValue, hi: hi.param.currentValue,
+                                                          loStrict: spec.loStrict, hiStrict: spec.hiStrict }, ws, fmtModel);
+            if (typeof field === "string") { console.log(`[Slicers] ${info.caption || ref.name} (dates between ${lo.param.name} and ${hi.param.name}) stays fixed: ${field}`); continue; }
+            (lo.paramFields = lo.paramFields || []).push({ field, end: "from" });
+            (hi.paramFields = hi.paramFields || []).push({ field, end: "to" });
+            lo.rowCount = hi.rowCount = 3;                       // title, Year / Month / Day dropdowns, the date
+          }
+        }
+      }
+      if (filterValueItems.some(it => it.slicer || it.control || it.paramFields)) {
         for (const item of dataWorksheetItems) {
           const vmod = item.visualModel;
           const pie = vmod && vmod.pie;
@@ -13427,7 +13623,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         }
         if (!dataWorksheetItems.some(it => it.vm && it.vm.slicerBinding)) {
           console.log(`[Slicers] ${dashboard.name}: no visual can follow the slicers – the filter cards stay cards`);
-          filterValueItems.forEach(it => { if (it.slicer || it.control) { delete it.slicer; delete it.control; it.rowCount = 2; } });
+          filterValueItems.forEach(it => { if (it.slicer || it.control || it.paramFields) { delete it.slicer; delete it.control; delete it.paramFields; it.rowCount = 2; } });
           slicers.discard();
         }
       }
@@ -13519,6 +13715,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         item.splitPx = tableColumnPx(item.vm);                 // the widths Tableau draws the table at
       } else if (item.isKPI && !item.kpiCard) item.split = [1, 1];
       else if (item.kpiCard && item.kpiCard.tiles.length > 1) item.split = item.kpiCard.tiles.map(() => 1);
+      else if (item.paramFields) item.split = [4, 4, 3];                  // a date's Year / Month / Day dropdowns
     });
     const grid = buildColumnGrid(allItems);
     const placedItems = allItems.map((item, idx) => {
@@ -13781,6 +13978,11 @@ setTableVisibleRows(placedItems);
         controlCards++;
         continue;
       }
+      if (item.type === "filterValue" && item.paramFields) {      // a Start / End date parameter the visuals follow
+        writeParamDateCard(worksheet, item, tracker, ctx.slicers);
+        controlCards++;
+        continue;
+      }
 
       if (item.type === "filterValue") {
         writeIndividualFilterTable(
@@ -14033,7 +14235,8 @@ setTableVisibleRows(placedItems);
                                  output: "Picture" })),
       ...pieLegendItems.map(it => ({ name: it.visualName, kind: "Colour legend", output: "Cells: a colour key per item" })),
       ...filterValueItems.map(it => ({ name: it.filterName, kind: it.isParameter ? "Parameter control" : "Filter card",
-                                       output: it.isParameter ? "Cells: its value" : it.slicer ? "Excel slicer (its selection as in Tableau)"
+                                       output: it.isParameter ? (it.paramFields ? "Date cell: the visuals follow it" : "Cells: its value")
+                                         : it.slicer ? "Excel slicer (its selection as in Tableau)"
                                          : it.control ? (it.control.field.kind === "list" ? "Dropdown cell (its value as in Tableau)" : "From / To date cells (the range as in Tableau)")
                                          : "Cells: the selected values" })),
       ...[...pieCentreSheets].map(name => ({ name, kind: "Worksheet in a donut's hole", output: "The donut's centre text" }))
