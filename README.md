@@ -78,7 +78,7 @@ In the panel, **📁 Load workbook file manually** reads the dashboard's `.twbx`
 
 ## Deploy
 
-1. Host the repository files (`index.html`, `build_table_copy.js`, `js/`) on any HTTPS web server (Tableau requires HTTPS for non-localhost extensions). ExcelJS 4.4 and JSZip 3.10 load from their CDNs.
+1. Host the repository files (`index.html`, `build_table_copy.js`, `js/`) on any HTTPS web server (Tableau requires HTTPS for non-localhost extensions). ExcelJS 4.4 and JSZip 3.10 load from `js/` – no outside website is needed.
 2. In `Export.trex`, set `<source-location><url>` to the hosted `index.html`, and raise `extension-version` for each release.
 3. Tableau Server / Cloud: add the URL to the extension allow list (Settings → Extensions).
 4. Hand out the updated `Export.trex`; users add it through **Access Local Extensions**.
@@ -100,7 +100,27 @@ What the chart model reads from the workbook, beyond shelves and marks: Dual Axi
 
 Adding support for a new kind of visual usually means a rule in `visual/classify.js` and either a chart spec builder in `charts/model/` or a cell writer in `export/`; a construction or approximation names itself in `spec.conversion` so the report says what it is.
 
-Settings that change the output are in the `config.js` section (`FORMAT_CONFIG`): `conversionReport` (the report sheet), `fallbackNotes` (notes on visuals exported as data), `chartPolicy` and more; `debug: true` logs the parsed workbook model and formatting traces to the browser console.
+Settings that change the output are in the `config.js` section (`FORMAT_CONFIG`): `conversionReport` (the report sheet), `fallbackNotes` (notes on visuals exported as data), `chartPolicy`, `slicers` / `slicerMaxRows` and more; `debug: true` logs the parsed workbook model and formatting traces to the browser console.
+
+### Slicers (`export/slicers.js`)
+
+A dashboard filter card becomes an Excel control where the card was, with Tableau's selection, and the charts, tables and KPI values of the same data source **cross-filter** with it:
+
+| Tableau card | Excel |
+|---|---|
+| Multiple values (dropdown, list) of a field (Region, YEAR(Order Date) …) | a **slicer** |
+| Single value (dropdown, list, slider) | a **dropdown cell** (Data Validation list: (All) and the field's values) |
+| Range of dates (slider, range of dates) | **From** / **To** date cells (only dates within the data's) |
+
+Relative-date filters and ranges of measures (they filter marks, not rows) stay text cards.
+
+1. The data source's rows (one logical table, up to `slicerMaxRows`) go to a hidden **Slicer Data** sheet as an Excel table: a `Visible` column (`SUBTOTAL(103)` – 0 on a row the slicers hide – and 0 as well when a dropdown cell or the From / To cells leave the row out; the dropdowns' lists are on a hidden **Slicer Lists** sheet), the slicer fields, the measure fields the formulas need, and per visual a key column – the mark each row belongs to, found by the visual's dimensions under the sheet's other filters (a date range, a categorical filter).
+2. Each measure becomes a formula over the visible rows of its mark: `SUMIFS`, `AVERAGEIFS`, `MINIFS`, `MAXIFS`, `COUNTIFS`, a distinct count (`UNIQUE` / `FILTER`, Excel 2021 / 365), or a calculation of those (`SUM([Profit])/SUM([Sales])`). Chart values (`tvSum` keeps each value's marks), table cells and KPI values are written as these formulas, with Tableau's number as the cached result; a mark the slicers leave empty is a gap in a chart (`#N/A`) and a blank cell in a table.
+3. Before a visual is bound, the formulas are worked out on the rows with Tableau's selection and must give Tableau's own numbers. A visual that does not – a calculated or LOD dimension the rows lack, a table calculation, a filter that cannot be told – keeps its fixed values; so do nested donuts, gauges, packed bubbles and pictures. The Conversion Report lists which visuals follow the slicers and why the others do not.
+   A pie or donut that follows the slicers (`bindPie()`) has a formula for each slice's value and for its label: the label is rebuilt from Tableau's label text, with each value (and % of total) as `TEXT()` in Tableau's number format, and Excel draws it from that cell ("Value From Cells"), so it moves with its slice. A donut is drawn as a pie under a circle in the hole's colour (Excel puts a doughnut's labels on the ring); a centre line showing the slices' total links to a cell. Tableau's tooltips are left out of such a pie, and a text box or sheet floating over its centre keeps Tableau's numbers.
+4. `injectSlicers()` adds the table, slicer caches and slicers to the package as Excel writes them for a table slicer; one slicer cache per field is shared by every dashboard sheet of the file.
+
+Axes of bound charts scale with the data (only the workbook's own fixed range stays). Charts and tables keep the bars, points and rows Tableau drew: a value the filter left out at export adds to those, but a category or row only it has cannot appear – export with every value selected to have them all. Tableau's filter actions (click a mark to filter) have no Excel counterpart.
 
 ## Repository layout
 
@@ -110,10 +130,10 @@ build_table_copy.js       the whole extension, one section per module:
                             format/ config util twb/   parsing and the formatting cascade
                             data/ visual/              view model, matrix pivot, classification, semantics, strategy
                             charts/model/ writer/      renderer-neutral chart specs → DrawingML / chartex parts
-                            export/                    layout, workbook writing, Conversion Report, Visual Data sheet
+                            export/                    layout, workbook writing, slicers, Conversion Report, Visual Data sheet
                             ui/ cloud/                 panel status, workbook storage, backend auto-load, other dashboards
                             main.js                    panel wiring
-js/                       Tableau Extensions API library
+js/                       Tableau Extensions API library, ExcelJS 4.4, JSZip 3.10
 Export.trex               extension manifest (points Tableau at the hosted index.html)
 .github/workflows/ci.yml  CI: syntax check of build_table_copy.js, page and manifest checks
 ```
@@ -125,9 +145,9 @@ This is a **Tableau dashboard extension**: it runs inside a dashboard in Tableau
 Visual fidelity follows the strategies above; the Conversion Report names every construction, approximation and fallback. Known limits:
 
 - **Maps** of every kind are exported as tables of their marks (location fields and values): Excel's map charts cannot reproduce Tableau's geography, layers or colour scales reliably.
-- **Calculations** – calculated fields, LOD expressions, table calculations – arrive as Tableau's computed values; formulas are not translated into Excel formulas. The report lists each calculation and its kind.
-- **Filters and parameters** apply as they were at export time; the report lists them. There are no slicers: Excel has no live link back to Tableau.
-- **Tooltips** appear on hover for pies, donuts and packed bubbles; elsewhere their fields are in the data only. Actions, highlighting and drill-down are not reproduced.
+- **Calculations** – calculated fields, LOD expressions, table calculations – arrive as Tableau's computed values. Only the values of visuals that follow a slicer become Excel formulas (sums, averages, min / max, counts and calculations of those); the report lists each calculation and its kind.
+- **Filters and parameters**: a filter card of a field's values becomes a slicer (several values) or a dropdown cell (one value), and a range of dates From / To cells, that cross-filter the visuals of its data source (see *Slicers*); relative-date and measure filters and parameters apply as they were at export time, and the report lists them. Excel has no live link back to Tableau.
+- **Tooltips** appear on hover for pies, donuts (not when they follow a slicer) and packed bubbles; elsewhere their fields are in the data only. Actions, highlighting and drill-down are not reproduced.
 - **Shapes and sizes** Excel cannot draw (custom shape images in charts, bar widths by a measure, rounded bar ends) are left out and named in the report.
 
 The project should be evaluated against representative dashboards containing the visual types and formatting features it claims to support.

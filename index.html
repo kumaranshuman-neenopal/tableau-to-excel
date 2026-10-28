@@ -8,21 +8,19 @@
 
   <title>Mark2Table - Excel Export</title>
 
-  <!-- jQuery -->
-  <script src="https://code.jquery.com/jquery-3.2.1.min.js"></script>
-
-  <!-- Bootstrap -->
-  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css">
-  <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js"></script>
+  <!--
+    All libraries load from our own js folder (no outside websites), so the extension only
+    depends on the server it is hosted on. jQuery and Bootstrap were removed: they were unused.
+  -->
 
   <!-- Tableau Extensions Library -->
   <script src="./js/tableau.extensions.1.latest.js"></script>
 
-  <!-- ExcelJS Library -->
-  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <!-- ExcelJS Library (v4.4.0) -->
+  <script src="./js/exceljs.min.js"></script>
 
   <!-- JSZip Library - reads .twbx files in the browser for title extraction -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="./js/jszip.min.js"></script>
 
   <style>
     :root {
@@ -75,6 +73,7 @@
     }
 
     button { font-family: inherit; }
+    label { font-weight: 600; }
 
     .btn-load {
       background: #ffffff;
@@ -210,13 +209,13 @@
     </button>
 
     <!--
-      Advanced: backend (Worker) connection. Collapsed by default.
-      In production DEFAULT_BACKEND_URL in build_table_copy.js is set and this can stay hidden.
+      Advanced: backend connection. Collapsed by default. Used only for testing (GitHub Pages + tunnel).
+      When the extension is hosted by the backend on a client server, it hides itself automatically.
     -->
     <details id="backend_settings">
       <summary>Advanced: backend connection</summary>
       <label for="backend_url">Backend URL</label>
-      <input id="backend_url" type="url" placeholder="https://…trycloudflare.com" autocomplete="off">
+      <input id="backend_url" type="url" placeholder="https://…trycloudflare.com (testing only)" autocomplete="off">
       <label for="backend_key">Backend key</label>
       <input id="backend_key" type="text" placeholder="(optional)" autocomplete="off">
       <button id="backend_save" class="btn-load">Save &amp; reconnect</button>
