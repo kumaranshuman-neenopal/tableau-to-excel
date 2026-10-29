@@ -19,11 +19,11 @@ jobs:
           node-version: 20
 
       - name: Syntax check
-        run: node --check build_table_copy.js
+        run: node --check tableau-to-excel.js
 
       - name: Page and manifest
         run: |
-          grep -q 'src="./build_table_copy.js"' index.html
+          grep -q 'src="./tableau-to-excel.js"' index.html
           grep -q 'src="./js/tableau.extensions.1.latest.js"' index.html
           test -f js/tableau.extensions.1.latest.js
           grep -q '<source-location>' Export.trex

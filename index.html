@@ -195,7 +195,7 @@
     <div class="section-title">Workbook formatting</div>
 
     <!--
-      Status line, updated by build_table_copy.js (auto-load progress, result, or fallback hint).
+      Status line, updated by tableau-to-excel.js (auto-load progress, result, or fallback hint).
       id="twb_file_label" must match exactly what the JS expects.
     -->
     <div id="twb_file_label">Connecting…</div>
@@ -249,7 +249,7 @@
   </div>
 
   <!--
-    IMPORTANT: build_table_copy.js is loaded at the BOTTOM of <body>,
+    IMPORTANT: tableau-to-excel.js is loaded at the BOTTOM of <body>,
     NOT in <head>. This ensures the DOM elements above (load_workbook_btn,
     twb_file_label, export_button) all exist before the JS runs and tries
     to find them with getElementById.
@@ -257,7 +257,7 @@
     Previously it was in <head> which caused getElementById to return null
     for every element, making all buttons non-functional.
   -->
-  <script src="./build_table_copy.js"></script>
+  <script src="./tableau-to-excel.js"></script>
 
 </body>
 

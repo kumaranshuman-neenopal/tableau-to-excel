@@ -1,11 +1,11 @@
 /* ══════════════════════════════════════════════════════════════════════════════════════════════════════
- * build_table_copy.js — Tableau dashboard extension: Export to Excel (NeenOpal)
+ * tableau-to-excel.js — Tableau dashboard extension: Export to Excel (NeenOpal)
  * ──────────────────────────────────────────────────────────────────────────────────────────────────────
- * ONE file, merged from two code bases that grew out of the same v0.6.0 build_table_copy.js:
+ * ONE file, merged from two code bases that grew out of the same v0.6.0 build_table_copy.js (this file's former name):
  *   • the visual export engine (Export_extension_XML / Export2Sheet, src/ modules): tables, KPI cards,
  *     text boxes, images, backgrounds, Tableau-exact layout, NATIVE EXCEL CHARTS (bar, line, area, pie,
  *     donut, scatter, bubble, combo, treemap, waterfall, box plot, Gantt …), Conversion Report sheet;
- *   • the Tableau Cloud features of build_table_copy.js: the workbook loaded automatically through the
+ *   • the Tableau Cloud features of the former build_table_copy.js: the workbook loaded automatically through the
  *     backend (Worker), every visible dashboard read through hidden Embedding API views, the one-time
  *     Tableau sign-in, and ONE Excel sheet per dashboard.
  *
@@ -29,7 +29,7 @@
 (function () {
 
 if (typeof ExcelJS === "undefined" || typeof JSZip === "undefined") {
-  console.error("[Export] ExcelJS and JSZip must be loaded (script tags in index.html) before build_table_copy.js");
+  console.error("[Export] ExcelJS and JSZip must be loaded (script tags in index.html) before tableau-to-excel.js");
 }
 
 /* ═══ format/number-format.js ═════════════════════════════════════════════════════════════════════ */
