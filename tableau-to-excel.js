@@ -3760,7 +3760,7 @@ function parasXml(lines, algn) {
   }).join("");
 }
 const richXml = lines => `<c:rich><a:bodyPr/><a:lstStyle/>${parasXml(lines)}</c:rich>`;
-const txPrXml = f => `<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr${fontAttrs(f)}>${fontKids(f)}</a:defRPr></a:pPr>` +
+const txPrXml = (f, bodyPr) => `<c:txPr>${bodyPr || "<a:bodyPr/>"}<a:lstStyle/><a:p><a:pPr><a:defRPr${fontAttrs(f)}>${fontKids(f)}</a:defRPr></a:pPr>` +
                      `<a:endParaRPr lang="en-US"/></a:p></c:txPr>`;
 const NO_LINE = `<a:ln><a:noFill/></a:ln>`;
 const fillXml = c => c ? `<a:solidFill><a:srgbClr val="${c}"/></a:solidFill>` : `<a:noFill/>`;
@@ -3795,11 +3795,16 @@ const NS_C15 = "http://schemas.microsoft.com/office/drawing/2012/chart";
 /** slice labels Excel takes from a range of cells ("Value From Cells", Excel 2013+): they move with the slices
  * @param {{ range: string, texts: string[], font: any }} l @param {boolean} doughnut */
 function cellLabelsXml(l, doughnut) {
-  const dLbls = `<c:dLbls><c:spPr><a:noFill/>${NO_LINE}</c:spPr>${txPrXml(l.font)}` +
+  // wrap="none": each label keeps Tableau's lines (Excel would wrap them to a narrow width, mid-word)
+  const look = `<c:spPr><a:noFill/>${NO_LINE}</c:spPr>${txPrXml(l.font, '<a:bodyPr wrap="none"/>')}` +
     (doughnut ? "" : `<c:dLblPos val="outEnd"/>`) +
     `<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/>` +
-    `<c:showBubbleSize val="0"/>${doughnut ? "" : `<c:showLeaderLines val="1"/>`}` +
-    `<c:extLst><c:ext uri="{CE6537A1-D6FC-4f65-9D91-7224C49458BB}" xmlns:c15="${NS_C15}"><c15:showDataLabelsRange val="1"/></c:ext></c:extLst></c:dLbls>`;
+    `<c:showBubbleSize val="0"/>`;
+  const fromCells = `<c:extLst><c:ext uri="{CE6537A1-D6FC-4f65-9D91-7224C49458BB}" xmlns:c15="${NS_C15}"><c15:showDataLabelsRange val="1"/></c:ext></c:extLst>`;
+  // a label pushed off its neighbour (cellLabelShifts): its shift from Excel's own place
+  const moved = (l.shifts || []).map((d, i) => d ? `<c:dLbl><c:idx val="${i}"/><c:layout><c:manualLayout>` +
+    `<c:x val="${d.x.toFixed(4)}"/><c:y val="${d.y.toFixed(4)}"/></c:manualLayout></c:layout>${look}${fromCells}</c:dLbl>` : "").join("");
+  const dLbls = `<c:dLbls>${moved}${look}${doughnut ? "" : `<c:showLeaderLines val="1"/>`}${fromCells}</c:dLbls>`;
   const range = `<c:extLst><c:ext uri="{02D57815-91ED-43cb-92C2-25804820EDAC}" xmlns:c15="${NS_C15}"><c15:datalabelsRange>` +
     `<c15:f>${esc(l.range)}</c15:f><c15:dlblRangeCache>${strPts(l.texts)}</c15:dlblRangeCache></c15:datalabelsRange></c:ext></c:extLst>`;
   return { dLbls, range };
@@ -3922,6 +3927,10 @@ const ZONE_MARGIN = 4;
 /** @param {number | null | undefined} sizeValue Size slider */
 const pieDiameterPx = sizeValue => sizeValue === null || sizeValue === undefined ? PIE_DIAMETER_PX : PIE_DIAMETER_PX * Math.max(0.01, sizeValue);
 
+/** a pie label value's number format: the workbook's, else for % of Total Tableau's 2 decimals (its API's
+ * formatted value has 4) @param {any} fmt @param {FieldRef} ref */
+const pieNumFmt = (fmt, ref) => fmt.numFmtFor(ref) || (/^pcto/i.test(String(ref.deriv || "")) ? "0.00%" : null);
+
 /** Excel chart font from Tableau props; measureName = Tableau's own font, for text measuring */
 function pieFont(p) {
   const f = tfExcelFont(p || {});
@@ -3989,6 +3998,58 @@ function pieLabelLayout(points, g) {
     });
   }
   return boxes;
+}
+
+/**
+ * Labels Excel draws from cells (a pie that follows the slicers) sit outside each slice where Excel puts them, and
+ * Excel never moves one off another: Tableau pushes crowded labels apart (two thin slices side by side), so do the
+ * same – per point the shift, in chart fractions, from Excel's own place, or null. Excel keeps the shift when the
+ * slicers resize the slices, so a label still follows its slice. Excel's place is estimated: the box just outside
+ * the slice's mid-point, centred on the line from the centre; overlapping boxes are pushed apart along the axis
+ * that needs the least move, inside the chart.
+ * @param {any[]} points @param {{ cx: number, cy: number, R: number, w: number, h: number }} g px
+ * @returns {({ x: number, y: number } | null)[]}
+ */
+function cellLabelShifts(points, g) {
+  const GAP = 4, SPACE = 3;
+  const total = points.reduce((s, p) => s + Math.abs(p.value || 0), 0) || 1;
+  let acc = 0;
+  const boxes = points.map(p => {
+    const mid = (acc + Math.abs(p.value || 0) / 2) / total * 2 * Math.PI;   // clockwise from 12 o'clock
+    acc += Math.abs(p.value || 0);
+    if (!p.label || !p.label.length || !p.value) return null;
+    let w = 0, h = 0;
+    p.label.forEach(line => {
+      const px = f => (f.size || 9) * 4 / 3;
+      w = Math.max(w, line.reduce((t, x) => t + textWidthPx(x.text, x.font, px(x.font)), 0));
+      h += (line.length ? Math.max(...line.map(x => px(x.font))) : px({})) * 1.2;
+    });
+    const s = Math.sin(mid), c = Math.cos(mid);
+    const cx = g.cx + (g.R + GAP) * s + w / 2 * s, cy = g.cy - (g.R + GAP) * c - h / 2 * c;
+    return { x: cx - w / 2, y: cy - h / 2, w, h, x0: cx - w / 2, y0: cy - h / 2 };
+  });
+  const live = boxes.filter(Boolean);
+  const clamp = b => { b.x = Math.max(0, Math.min(g.w - b.w, b.x)); b.y = Math.max(0, Math.min(g.h - b.h, b.y)); };
+  for (let pass = 0; pass < 30; pass++) {
+    let moved = false;
+    for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
+      const a = live[i], b = live[j];
+      const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) + SPACE;
+      const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) + SPACE;
+      if (ox <= SPACE || oy <= SPACE) continue;
+      moved = true;
+      const k = ox <= oy ? "x" : "y", size = k === "x" ? "w" : "h";
+      const [lo, hi] = a[k] + a[size] / 2 <= b[k] + b[size] / 2 ? [a, b] : [b, a];
+      const d = Math.min(ox, oy) / 2;
+      lo[k] -= d; hi[k] += d;
+      clamp(lo); clamp(hi);
+    }
+    if (!moved) break;
+  }
+  return boxes.map(b => {
+    if (!b || (Math.abs(b.x - b.x0) < 0.5 && Math.abs(b.y - b.y0) < 0.5)) return null;
+    return { x: (b.x - b.x0) / g.w, y: (b.y - b.y0) / g.h };
+  });
 }
 
 /* ── text ──────────────────────────────────────────────────────────────── */
@@ -4098,14 +4159,14 @@ function buildPieSpec(fmt, summary, opts = {}) {
   const totals = {};
   const valueOf = r => ref => {
     const ci = colFor(ref);
-    if (ci >= 0) return formatNum(tfDvNum(r[ci]), fmt.numFmtFor(ref)) || tfDvText(r[ci]);
+    if (ci >= 0) return formatNum(tfDvNum(r[ci]), pieNumFmt(fmt, ref)) || tfDvText(r[ci]);
     if (!/^pcto/i.test(ref.deriv || "")) return "";
     const base = tfNorm(ref.name.split(":").pop());
     const bi = cols.findIndex(c => c.numeric && c.ref && tfNorm(c.ref.name) === base);
     if (bi < 0) return "";
     if (totals[bi] === undefined) totals[bi] = marks.reduce((s, m) => s + (tfDvNum(m.r[bi]) || 0), 0);
     // % of the whole table (Tableau's default scope); other "compute using" scopes are not replicated
-    const nf = fmt.numFmtFor(ref);
+    const nf = pieNumFmt(fmt, ref);
     const dec = nf ? ((nf.match(/\.(0+)/) || [, ""])[1].length) : 2;
     return totals[bi] ? (100 * (tfDvNum(r[bi]) || 0) / totals[bi]).toFixed(dec) + "%" : "";
   };
@@ -4151,7 +4212,7 @@ function buildPieSpec(fmt, summary, opts = {}) {
     const parts = [];
     const lines = renderTemplate(labelTpl, ref => {
       const k = colFor(ref);
-      parts.push({ ref, col: k, text: valueOf(r)(ref), nf: fmt.numFmtFor(ref) });
+      parts.push({ ref, col: k, text: valueOf(r)(ref), nf: pieNumFmt(fmt, ref) });
       return `\u0002${parts.length - 1}\u0003`;
     });
     return { lines: lines.map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))), parts };
@@ -4203,7 +4264,7 @@ function buildHoleSpec(fmt, pie) {
     const k = pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ref));
     if (k < 0) return "";
     const hit = own.get(pts[0].rowKey + "\u0001" + pts[0].colKey);
-    if (hit) return formatNum(tfDvNum(hit[k]), fmt.numFmtFor(ref)) || tfDvText(hit[k]);
+    if (hit) return formatNum(tfDvNum(hit[k]), pieNumFmt(fmt, ref)) || tfDvText(hit[k]);
     const dvs = pts.map(p => pie.data[p.row][k]);
     if (!pie.columns[k].numeric) { const u = [...new Set(dvs.map(tfDvText))]; return u.length === 1 ? u[0] : "*"; }
     const nums = dvs.map(tfDvNum).filter(v => v !== null);
@@ -4212,7 +4273,7 @@ function buildHoleSpec(fmt, pie) {
     // AVG / CNTD re-aggregated as a plain mean / sum of the slices, not from the raw rows
     const sum = nums.reduce((a, b) => a + b, 0);
     const v = d === "min" ? Math.min(...nums) : d === "max" ? Math.max(...nums) : d === "avg" ? sum / nums.length : sum;
-    return formatNum(v, fmt.numFmtFor(ref)) || formatLike(dvs.find(x => tfDvNum(x) !== null), v);
+    return formatNum(v, pieNumFmt(fmt, ref)) || formatLike(dvs.find(x => tfDvNum(x) !== null), v);
   };
   // hover text: the Tooltip editor if set; else, like Tableau, "Caption: value" for every field the hole's own
   // row has a value for, dimensions first, then by field name
@@ -4234,7 +4295,7 @@ function buildHoleSpec(fmt, pie) {
       if (!shown) return null;
       const parts = [];
       const lines = renderTemplate(tpl, ref => {
-        parts.push({ ref, col: pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ref)), text: valueOf(pts)(ref), nf: fmt.numFmtFor(ref) });
+        parts.push({ ref, col: pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ref)), text: valueOf(pts)(ref), nf: pieNumFmt(fmt, ref) });
         return `\u0002${parts.length - 1}\u0003`;
       });
       return { lines: lines.map(line => line.map(x => ({ text: x.text, font: pieFont(fmt.labelFont(x.props)) }))), parts };
@@ -4365,6 +4426,9 @@ function writePieData(ds, startRow, pie, name) {
     const d = String(part.ref.deriv || "").toLowerCase();
     if (/^pcto/.test(d)) {
       if (base && base.ref && tfNorm(part.ref.name.split(":").pop()) === tfNorm(base.ref.name)) return `${at}/${total}`;
+      // % of total of another measure: its own formula over the visible rows
+      const f = part.col >= 0 && p ? bound.formulaFor([pie.data[p.row]], part.col, "cell") : null;
+      if (f) return f;
     } else if (part.col === pie.valueCol) return at;
     else if (part.col >= 0 && pie.columns[part.col].numeric && p) {
       const f = bound.formulaFor([pie.data[p.row]], part.col, "cell");
@@ -4501,7 +4565,8 @@ function buildPieCharts(pie, block, paneRefs, o) {
       else texts.push({ x: 0, y: 0, w: pw, h: ph, lines: centre, anchor: "ctr" });
     }
     const labelFont = (pts.find(p => p.label && p.label.length && p.label[0].length) || { label: [[{ font: pie.font }]] }).label[0][0].font;
-    const cellLabels = bound && pts.some(p => p.label) ? { range: sheetRef(refs.ref.sheet, refs.ref.lbl), texts: pts.map(p => p.label ? plainText(p.label) : ""), font: labelFont } : null;
+    const cellLabels = bound && pts.some(p => p.label) ? { range: sheetRef(refs.ref.sheet, refs.ref.lbl), texts: pts.map(p => p.label ? plainText(p.label) : ""), font: labelFont,
+      shifts: holeAsCircle || !holeD ? cellLabelShifts(pts, { cx: pw / 2, cy: ph / 2, R: D / 2, w: pw, h: ph }) : [] } : null;
     const x = M + cj * pw, y = ri * ph;
     const spec = {
       seriesName: pie.valueCaption, categories: pts.map(p => p.category), values: pts.map(p => p.value), ref: refs.ref,
