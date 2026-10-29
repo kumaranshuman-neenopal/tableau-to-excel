@@ -5476,8 +5476,52 @@ function tvWaterfallSpec(ctx) {
     labelCull: !roles.panes.some(p => tvPaneRule(p, "mark", "mark-labels-cull") === "false"),
     categories: { names: catDims.length ? catDims.map(d => tvMeasureLabel(vm, d.ci)) : [""], levels: cats.levels },
     categoryTitle: fieldLabels ? catDims.map(d => tvMeasureLabel(vm, d.ci)).join(" / ") : "",
-    numFmt, valueTitle: label, series
+    numFmt, valueTitle: label, series,
+    // what bindWaterfall needs to rebuild the steps with formulas (series: base, increase, decrease[, grand total][, labels])
+    waterfall: { running, ref: vm.cols[measure.ci].ref, totals: !!(totals && running.length),
+                 labels: above ? { running: labelCi === measure.ci, fmt: labelFmt,
+                                   // the step itself (the running total's own measure) – Tableau's usual waterfall label
+                                   step: labelCi !== measure.ci && !!vm.cols[labelCi].ref && !!tfTableCalcBase(vm.cols[measure.ci].ref) &&
+                                         tfSameField(vm.cols[labelCi].ref, tfTableCalcBase(vm.cols[measure.ci].ref)) } : null }
   }];
+}
+
+/**
+ * A waterfall following the slicers: each step a formula of the running total's base measure (checked against
+ * Tableau's steps), the running total adding them up, and the invisible base, the increase / decrease bars, the
+ * grand total and the labels computed from it – cells of the chart's data (writeChartData: helpers, cellFormula).
+ * false when the steps cannot be rebuilt from the rows: the waterfall keeps Tableau's values.
+ * @param {ChartSpec} spec @param {any} binding vm.slicerBinding
+ */
+function bindWaterfall(spec, binding) {
+  const w = /** @type {any} */ (spec).waterfall, run = w && w.running, src = run && run.src;
+  const base = w && w.ref && tfTableCalcBase(w.ref);
+  if (!src || !base || run.some(v => v === null)) return false;
+  const n = run.length, steps = run.map((v, i) => v - (i ? run[i - 1] : 0));
+  const f = binding.measureFormulas(base, src.rows, src.ci, steps, "zero");
+  if (!f) return false;
+  const RT = "Running total";
+  const cur = (i, at) => at("helper", RT, Math.min(i, n - 1));
+  const prev = (i, at) => (i ? at("helper", RT, i - 1) : "0");
+  /** @type {any} */ (spec).helpers = [
+    { name: "Step", results: steps, formula: i => (i < n ? f[i] : null) },
+    { name: RT, results: run, formula: (i, at) => (i >= n ? null : i ? `${prev(i, at)}+${at("helper", "Step", i)}` : at("helper", "Step", i)) }
+  ];
+  const S = spec.series;
+  S[0].cellFormula = (i, at) => (i < n ? `MIN(${prev(i, at)},${cur(i, at)})` : null);
+  S[1].cellFormula = (i, at) => (i < n ? `IF(${cur(i, at)}>${prev(i, at)},${cur(i, at)}-${prev(i, at)},NA())` : null);
+  S[2].cellFormula = (i, at) => (i < n ? `IF(${cur(i, at)}<${prev(i, at)},${prev(i, at)}-${cur(i, at)},NA())` : null);
+  if (w.totals) S[3].cellFormula = (i, at) => (i === n ? cur(i, at) : null);
+  if (w.labels) {
+    const lab = S[S.length - 1];
+    lab.cellFormula = (i, at) => (i < n ? `MAX(${prev(i, at)},${cur(i, at)})` : cur(i, at));
+    const fmt = `"${String(w.labels.fmt || "General").replace(/"/g, '""')}"`;
+    if (w.labels.running) lab.labelFormula = (i, at) => `TEXT(${cur(i, at)},${fmt})`;
+    // the step's label; the grand total's is its running total
+    else if (w.labels.step) lab.labelFormula = (i, at) => `TEXT(${i < n ? at("helper", "Step", i) : cur(i, at)},${fmt})`;
+  }
+  binding.written += n;
+  return true;
 }
 
 /* ── box plot: quartiles per category → line chart with up/down bars (box),
@@ -8489,9 +8533,8 @@ async function readWorkbookFile(file) {
   }
 }
 
-/* Asks where to save BEFORE the export runs: the picker needs the click's user
- * activation, which the data fetch would outlast. → handle, null (no picker API /
- * picker failed → plain download), or "cancelled". */
+/* The save dialog → handle, null (no picker API / picker failed → plain download), or "cancelled". It needs a
+ * click's user activation: it runs from the Save button's click (saveExport). */
 async function chooseSaveTarget(suggestedName) {
   if (typeof window.showSaveFilePicker !== "function") return null;
   const options = {
@@ -8513,6 +8556,82 @@ async function chooseSaveTarget(suggestedName) {
     }
     console.warn("[Export] save dialog unavailable, using browser download:", err && err.message);
     return null;
+  }
+}
+
+/* =============================================================================
+ * Saving the finished file. The save dialog is opened only once the file is built, by its own click (💾 Save
+ * Excel file): a file picked before the export would sit empty on disk while the export runs – opened then,
+ * Excel reports an invalid file, and the browser's final swap into it fails while Excel holds it.
+ * ============================================================================= */
+/** @type {{ blob: Blob, name: string } | null} the last export, until it is saved */
+let pendingExport = null;
+
+function downloadBlob(blob, name) {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+/** the panel's Save button, right under Export (made the first time) */
+function saveButton() {
+  let b = /** @type {HTMLButtonElement | null} */ (document.getElementById("save_button"));
+  if (b) return b;
+  const exp = document.getElementById("export_button");
+  b = /** @type {HTMLButtonElement} */ (document.createElement("button"));
+  b.id = "save_button";
+  b.type = "button";
+  b.className = exp ? String(exp.className || "").replace(/\bhas-tip\b/, "").trim() : "";
+  b.style.marginTop = "6px";
+  b.textContent = "💾 Save Excel file";
+  b.hidden = true;
+  b.addEventListener("click", () => { saveExport(); });
+  if (exp && exp.insertAdjacentElement) exp.insertAdjacentElement("afterend", b);
+  return b;
+}
+
+/** The built file: a Save button that opens the save dialog (or, without that dialog, a download right away).
+ * → true when the Save button waits for a click */
+function offerSave(blob, name) {
+  if (typeof window.showSaveFilePicker !== "function") { downloadBlob(blob, name); return false; }
+  pendingExport = { blob, name };
+  const b = saveButton();
+  b.hidden = false;
+  b.disabled = false;
+  return true;
+}
+
+/** The Save button's click: where to save, then the file written in one go. A file Excel has open cannot be
+ * replaced – the button stays, to save again once it is closed (or under another name). */
+async function saveExport() {
+  if (!pendingExport) return;
+  const b = saveButton(), { blob, name } = pendingExport;
+  b.disabled = true;
+  try {
+    const target = await chooseSaveTarget(name);
+    if (target === "cancelled") { appendExportStatus("Not saved yet – click 💾 Save Excel file to choose where"); return; }
+    if (!target) {
+      downloadBlob(blob, name);
+      appendExportStatus(`downloaded as ${name}`);
+    } else {
+      const writable = await target.createWritable();
+      try { await writable.write(blob); await writable.close(); }
+      catch (e) { try { await writable.abort(); } catch (_) { /* already closed */ } throw e; }
+      console.log(`[Export] saved to ${target.name}`);
+      appendExportStatus(`saved as ${target.name} – you can open it now`);
+    }
+    pendingExport = null;
+    b.hidden = true;
+  } catch (err) {
+    console.error("[Export] save failed", err);
+    const locked = (err && /NoModificationAllowed|InvalidState/.test(err.name)) || /in use|locked|being used|access/i.test(String(err && err.message));
+    appendExportStatus(locked
+      ? "Not saved: the file is open in Excel. Close it there, then click 💾 Save Excel file again (or save under another name)."
+      : `Not saved: ${err && err.message}. Click 💾 Save Excel file to try again.`);
+  } finally {
+    b.disabled = false;
   }
 }
 
@@ -10200,11 +10319,21 @@ function writeChartData(ws, spec, startRow) {
   // a date axis reads real dates
   const dates = spec.dateAxis ? spec.dateAxis.serials : null;
   const dateFmt = spec.dateAxis && { years: "yyyy", months: "mmm yyyy", days: "d mmm yyyy" }[spec.dateAxis.base];
+  // cells computed from other cells of the chart (a waterfall following the slicers): series with cellFormula, label
+  // texts with labelFormula, and helper columns (spec.helpers) after the labels; at(kind, key, i) → that cell's
+  // address – "series" k, "helper" name
+  const lblCount = spec.series.filter(s => s.labelTexts).length;
+  const helpers = spec.helpers || [];
+  const helperCol = name => L + spec.series.length + lblCount + helpers.findIndex(h => h.name === name);
+  const at = (kind, key, i) => `${getExcelColumnName(kind === "series" ? L + /** @type {number} */ (key) : helperCol(String(key)))}${startRow + 2 + i}`;
   for (let i = 0; i < N; i++) {
     if (dates) put(startRow + 1 + i, 0, dates[i], dateFmt);
     else for (let l = 0; l < L; l++) if (l === L - 1 || starts[l][i]) put(startRow + 1 + i, l, levels[l][i]);
     spec.series.forEach((s, k) => {
-      if (num(s.values[i]) !== null) put(startRow + 1 + i, L + k, valueAt(s.values, i), s.secondary ? spec.secondaryNumFmt : spec.numFmt);
+      const fmt = s.secondary ? spec.secondaryNumFmt : spec.numFmt;
+      const f = s.cellFormula ? s.cellFormula(i, at) : null;
+      if (f) put(startRow + 1 + i, L + k, num(s.values[i]) === null ? { formula: f } : { formula: f, result: s.values[i] }, fmt);
+      else if (num(s.values[i]) !== null) put(startRow + 1 + i, L + k, valueAt(s.values, i), fmt);
     });
   }
   // label texts taken from cells (Excel's "Value From Cells"), after the series columns
@@ -10213,8 +10342,16 @@ function writeChartData(ws, spec, startRow) {
     if (!s.labelTexts) return null;
     const c = lblCol++;
     put(startRow, c, s.name + " – label");
-    s.labelTexts.forEach((t, i) => put(startRow + 1 + i, c, t));
+    s.labelTexts.forEach((t, i) => {
+      const f = s.labelFormula ? s.labelFormula(i, at) : null;
+      put(startRow + 1 + i, c, f ? { formula: f, result: t } : t);
+    });
     return cellRef(sheet, c, startRow + 1, c, startRow + Math.max(1, N));
+  });
+  helpers.forEach(h => {
+    const c = helperCol(h.name);
+    put(startRow, c, h.name);
+    for (let i = 0; i < N; i++) { const f = h.formula(i, at); if (f) put(startRow + 1 + i, c, { formula: f, result: h.results[i] }, spec.numFmt); }
   });
   return {
     cat: cellRef(sheet, 0, startRow + 1, L - 1, startRow + N),
@@ -10439,7 +10576,8 @@ function valueRange(spec, axisPlot) {
   // values that follow slicers can grow past Tableau's: only the workbook's own range and spacing are kept, Excel
   // scales the rest (from zero when every value is positive, as Tableau's axis starts). Dots, targets and reference
   // lines over bars are drawn on an axis pinned to this range: such a chart keeps Tableau's
-  const follows = spec.valueFormula && spec.series.some(s => s.values && /** @type {any} */ (s.values).src) &&
+  // (a waterfall following them computes its bars from cells of its own: spec.helpers)
+  const follows = ((spec.valueFormula && spec.series.some(s => s.values && /** @type {any} */ (s.values).src)) || /** @type {any} */ (spec).helpers) &&
                   !spec.overlay && !spec.targets && !(spec.refLines && spec.refLines.length);
   if (follows) {
     const all = spec.series.flatMap(s => s.values || []).filter(v => num(v) !== null);
@@ -12203,13 +12341,361 @@ async function readSlicerSource(ws, fieldName) {
            columns: table.columns.map(c => ({ name: c.fieldName, dataType: String(c.dataType || "").toLowerCase() })) };
 }
 
-/** a workbook field → its column in the source rows (by caption, else by name); -1 when the rows do not have it (most
- * calculations – a row-level one Tableau includes is used, the check against Tableau's numbers decides)
+/** a workbook field → its column in the source rows (by caption, else by name); -1 when the rows do not have it. A
+ * calculated field the rows lack is computed row by row when it can be (slicerCalcColumn) and becomes a column of
+ * its own; the check against Tableau's numbers decides whether it is right.
  * @param {SlicerSource} source @param {FormatModel} model @param {FieldRef} ref */
 function slicerColumnOf(source, model, ref) {
   const info = tfFieldInfo(model, { ...ref, deriv: null });
   const names = [info && info.caption, ref.name].filter(Boolean).map(tfNorm);
-  return source.columns.findIndex(c => names.includes(tfNorm(c.name)));
+  const col = source.columns.findIndex(c => names.includes(tfNorm(c.name)));
+  return col >= 0 || !info || !(info.formulaFull || info.formula) || info.param ? col
+    : slicerCalcColumn(source, model, info.caption || info.name, info.formulaFull || info.formula, info.ds);
+}
+
+/* ── calculations computed row by row ─────────────────────────────────────────────────────────────────────────
+ * A row-level calculated field ([Category] + " - " + [Sub-Category], IF YEAR([Order Date]) = 2022 THEN [Sales] END)
+ * and a FIXED level of detail ({FIXED [Customer ID] : COUNT([Order ID])}) are computed for every source row and added
+ * to the source as columns: slicers, mark keys and the SUMIFS-style formulas then use them like any other column.
+ * A FIXED value is computed over all the rows – as Tableau computes it before the sheet's dimension filters (a slicer
+ * is one), so it stays as it is when a slicer changes. Parameters take their value at export. Anything else (table
+ * calculations, INCLUDE / EXCLUDE, unknown functions) is not computed: the field stays out of the rows. */
+
+/** a calculation's tokens: fields ([ds].[name]), strings, #dates#, numbers, words, operators */
+function slicerTokenize(formula) {
+  const s = String(formula).replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+  const re = /\s+|((?:\[[^\]]*\]\.)?\[[^\]]*\])|('(?:[^']|'')*'|"(?:[^"]|"")*")|(#[^#]*#)|(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)|([A-Za-z_][A-Za-z_0-9]*)|(<=|>=|<>|!=|==|&&|\|\|)|([-+*/%=<>(),{}:^])/y;
+  const out = [];
+  let m;
+  re.lastIndex = 0;
+  while (re.lastIndex < s.length && (m = re.exec(s))) {
+    if (m[0].trim()) out.push(m[0]);
+  }
+  if (re.lastIndex < s.length) return null;                    // a character it does not know
+  return out;
+}
+
+/** tokens → a syntax tree (null when it is not a calculation this evaluator reads) */
+function slicerParseRowCalc(tokens) {
+  if (!tokens) return null;
+  let i = 0;
+  const up = () => String(tokens[i] || "").toUpperCase();
+  const fail = () => { throw new Error("calc"); };
+  const take = t => { if (up() !== t) fail(); i++; };
+  const expr = () => or();
+  const or = () => { let a = and(); while (up() === "OR" || tokens[i] === "||") { i++; a = { t: "or", a, b: and() }; } return a; };
+  const and = () => { let a = not(); while (up() === "AND" || tokens[i] === "&&") { i++; a = { t: "and", a, b: not() }; } return a; };
+  const not = () => (up() === "NOT" ? (i++, { t: "not", a: not() }) : cmp());
+  const cmp = () => {
+    const a = add();
+    const op = tokens[i];
+    if (["=", "==", "!=", "<>", "<", "<=", ">", ">="].includes(op)) { i++; return { t: "cmp", op: op === "==" ? "=" : op === "<>" ? "!=" : op, a, b: add() }; }
+    return a;
+  };
+  const add = () => { let a = mul(); while (tokens[i] === "+" || tokens[i] === "-") { const op = tokens[i++]; a = { t: "bin", op, a, b: mul() }; } return a; };
+  const mul = () => { let a = unary(); while (tokens[i] === "*" || tokens[i] === "/" || tokens[i] === "%" || tokens[i] === "^") { const op = tokens[i++]; a = { t: "bin", op, a, b: unary() }; } return a; };
+  const unary = () => (tokens[i] === "-" ? (i++, { t: "neg", a: unary() }) : tokens[i] === "+" ? (i++, unary()) : primary());
+  const primary = () => {
+    const t = tokens[i++];
+    if (t === undefined) fail();
+    if (t === "(") { const e = expr(); take(")"); return e; }
+    if (/^\d/.test(t)) return { t: "lit", v: Number(t) };
+    if (t[0] === "'" || t[0] === '"') return { t: "lit", v: t.slice(1, -1).replace(t[0] === "'" ? /''/g : /""/g, t[0]) };
+    if (t[0] === "#") { const d = new Date(t.slice(1, -1).trim().replace(" ", "T") + (/T|:/.test(t) ? "" : "T00:00:00") + "Z"); return isNaN(+d) ? fail() : { t: "lit", v: d }; }
+    if (t[0] === "[") return { t: "field", raw: t };
+    if (t === "{") {                                             // {FIXED [a], [b] : AGG(…)} – FIXED only
+      const kind = up();
+      if (kind === "INCLUDE" || kind === "EXCLUDE") fail();
+      if (kind !== "FIXED") { const body = expr(); take("}"); return { t: "lod", dims: [], body }; }   // {MAX(…)}: the whole table
+      i++;
+      const dims = [];
+      while (tokens[i] !== ":") { dims.push(expr()); if (tokens[i] === ",") i++; else if (tokens[i] !== ":") fail(); }
+      i++;
+      const body = expr();
+      take("}");
+      return { t: "lod", dims, body };
+    }
+    const w = t.toUpperCase();
+    if (w === "TRUE" || w === "FALSE") return { t: "lit", v: w === "TRUE" };
+    if (w === "NULL") return { t: "lit", v: null };
+    if (w === "IF") {
+      const branches = [];
+      let c = expr(); take("THEN"); branches.push([c, expr()]);
+      while (up() === "ELSEIF") { i++; c = expr(); take("THEN"); branches.push([c, expr()]); }
+      let otherwise = null;
+      if (up() === "ELSE") { i++; otherwise = expr(); }
+      take("END");
+      return { t: "if", branches, otherwise };
+    }
+    if (w === "CASE") {
+      const subject = expr(), whens = [];
+      while (up() === "WHEN") { i++; const v = expr(); take("THEN"); whens.push([v, expr()]); }
+      let otherwise = null;
+      if (up() === "ELSE") { i++; otherwise = expr(); }
+      take("END");
+      return { t: "case", subject, whens, otherwise };
+    }
+    if (/^[A-Za-z_]/.test(t) && tokens[i] === "(") {
+      i++;
+      const args = [];
+      while (tokens[i] !== ")") { args.push(expr()); if (tokens[i] === ",") i++; else if (tokens[i] !== ")") fail(); }
+      i++;
+      return { t: "fn", name: w, args };
+    }
+    return fail();
+  };
+  try {
+    const e = expr();
+    return i === tokens.length ? e : null;
+  } catch (err) { return null; }
+}
+
+const SLICER_ROW_AGGS = new Set(["SUM", "AVG", "MIN", "MAX", "COUNT", "COUNTD", "ATTR", "MEDIAN"]);
+const SLICER_DAY_MS = 86400000;
+
+/**
+ * A calculation computed for every source row, added to the source as a column; its index, or -1 when it cannot be
+ * (it is remembered either way). key: the column's name (a field's caption, or the inline expression's text).
+ * @param {SlicerSource} source @param {FormatModel} model @param {string} key @param {string} formula @param {string} [ds]
+ */
+function slicerCalcColumn(source, model, key, formula, ds) {
+  const S = /** @type {any} */ (source);
+  S.calcCols = S.calcCols || new Map();
+  if (S.calcCols.has(key)) return S.calcCols.get(key);
+  S.calcCols.set(key, -1);                                     // a calculation that refers to itself stays out
+  const ast = slicerParseRowCalc(slicerTokenize(formula));
+  if (!ast) return -1;
+  const rows = source.rows;
+  /** a source value as the calculation sees it: a number, string, boolean, date (UTC midnight for a date) or null */
+  const valueOf = (dv, type) => {
+    if (tfIsNull(dv)) return null;
+    if (/date/.test(type)) {
+      const s = tvExcelSerial(dv);
+      if (s === null) return null;
+      return new Date(Math.round((/time/.test(type) ? s : Math.round(s)) * SLICER_DAY_MS - 25569 * SLICER_DAY_MS));
+    }
+    if (/^bool/.test(type)) return dv.value === true || /^true$/i.test(String(dv.value));
+    const v = dv.nativeValue !== undefined ? dv.nativeValue : dv.value;
+    if (/^(int|integer|float|real|number|double)/.test(type)) return tfDvNum(dv);
+    return v === null || v === undefined ? null : String(v);
+  };
+  /** a field of the calculation → (row → value); a parameter → its value at export */
+  const fieldFn = raw => {
+    const ref = tfParseFieldRef(raw.includes("].[") ? raw : ds ? `[${ds}].${raw}` : raw);
+    if (!ref) throw new Error("field");
+    if (/^parameters$/i.test(ref.ds || "") || /^\[Parameters\]/i.test(raw)) {
+      const p = model.fields["Parameters|" + ref.name.toLowerCase()];
+      if (!p) throw new Error("param");
+      const lit = slicerParseRowCalc(slicerTokenize(String(p.value || "")));
+      const v = lit && lit.t === "lit" ? lit.v : p.value === undefined ? null : Number(p.value);
+      return () => v;
+    }
+    const col = slicerColumnOf(source, model, { ...ref, deriv: "none" });
+    if (col < 0) throw new Error("field");
+    const type = source.columns[col].dataType;
+    return r => valueOf(rows[r][col], type);
+  };
+  const num = v => (v === null || v === undefined ? null : v instanceof Date ? v.getTime() / SLICER_DAY_MS + 25569 : typeof v === "boolean" ? (v ? 1 : 0) : typeof v === "number" ? v : isFinite(Number(v)) && String(v).trim() !== "" ? Number(v) : null);
+  const truthy = v => v === true || (typeof v === "number" && v !== 0);
+  const eq = (a, b) => (a instanceof Date || b instanceof Date ? num(a) === num(b) : typeof a === "number" || typeof b === "number" ? num(a) === num(b) : String(a) === String(b));
+  const dayOf = v => (v instanceof Date ? v : v === null ? null : typeof v === "number" ? new Date((v - 25569) * SLICER_DAY_MS) : new Date(String(v)));
+  const trunc = (part, d) => {
+    if (!d) return null;
+    const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    switch (part) {
+      case "year": return new Date(Date.UTC(y, 0, 1));
+      case "quarter": return new Date(Date.UTC(y, m - (m % 3), 1));
+      case "month": return new Date(Date.UTC(y, m, 1));
+      case "week": return new Date(Date.UTC(y, m, d.getUTCDate() - d.getUTCDay()));
+      case "day": return new Date(Date.UTC(y, m, d.getUTCDate()));
+      default: throw new Error("datepart");
+    }
+  };
+  const part = (p, d) => {
+    if (!d) return null;
+    switch (p) {
+      case "year": return d.getUTCFullYear();
+      case "quarter": return Math.floor(d.getUTCMonth() / 3) + 1;
+      case "month": return d.getUTCMonth() + 1;
+      case "day": return d.getUTCDate();
+      case "weekday": return d.getUTCDay() + 1;
+      case "week": { const j = Date.UTC(d.getUTCFullYear(), 0, 1); return Math.floor(((+trunc("week", d) - j) / SLICER_DAY_MS + new Date(j).getUTCDay()) / 7) + 1; }
+      default: throw new Error("datepart");
+    }
+  };
+  const lower = v => String(v).toLowerCase().replace(/^'|'$/g, "");
+  /** node → (row, group) → value; group: the rows an aggregate inside a FIXED computes over */
+  const compile = n => {
+    switch (n.t) {
+      case "lit": return () => n.v;
+      case "field": return fieldFn(n.raw);
+      case "neg": { const a = compile(n.a); return (r, g) => { const v = num(a(r, g)); return v === null ? null : -v; }; }
+      case "not": { const a = compile(n.a); return (r, g) => { const v = a(r, g); return v === null ? null : !truthy(v); }; }
+      case "and": { const a = compile(n.a), b = compile(n.b); return (r, g) => truthy(a(r, g)) && truthy(b(r, g)); }
+      case "or": { const a = compile(n.a), b = compile(n.b); return (r, g) => truthy(a(r, g)) || truthy(b(r, g)); }
+      case "cmp": {
+        const a = compile(n.a), b = compile(n.b);
+        return (r, g) => {
+          const x = a(r, g), y = b(r, g);
+          if (x === null || y === null) return null;
+          if (n.op === "=") return eq(x, y);
+          if (n.op === "!=") return !eq(x, y);
+          const p = typeof x === "string" && typeof y === "string" ? x.localeCompare(y) : num(x) - num(y);
+          return n.op === "<" ? p < 0 : n.op === "<=" ? p <= 0 : n.op === ">" ? p > 0 : p >= 0;
+        };
+      }
+      case "bin": {
+        const a = compile(n.a), b = compile(n.b);
+        return (r, g) => {
+          const x = a(r, g), y = b(r, g);
+          if (x === null || y === null) return null;
+          if (n.op === "+" && (typeof x === "string" || typeof y === "string")) return String(x) + String(y);
+          if (x instanceof Date && n.op === "-" && y instanceof Date) return (x.getTime() - y.getTime()) / SLICER_DAY_MS;
+          if (x instanceof Date && (n.op === "+" || n.op === "-")) return new Date(x.getTime() + (n.op === "+" ? 1 : -1) * num(y) * SLICER_DAY_MS);
+          const p = num(x), q = num(y);
+          if (p === null || q === null) return null;
+          switch (n.op) {
+            case "+": return p + q;
+            case "-": return p - q;
+            case "*": return p * q;
+            case "/": return q === 0 ? null : p / q;
+            case "%": return q === 0 ? null : p % q;
+            default: return Math.pow(p, q);
+          }
+        };
+      }
+      case "if": {
+        const br = n.branches.map(([c, v]) => [compile(c), compile(v)]), o = n.otherwise ? compile(n.otherwise) : () => null;
+        return (r, g) => { for (const [c, v] of br) if (truthy(c(r, g))) return v(r, g); return o(r, g); };
+      }
+      case "case": {
+        const s = compile(n.subject), wh = n.whens.map(([v, x]) => [compile(v), compile(x)]), o = n.otherwise ? compile(n.otherwise) : () => null;
+        return (r, g) => { const x = s(r, g); for (const [v, y] of wh) if (x !== null && eq(x, v(r, g))) return y(r, g); return o(r, g); };
+      }
+      case "lod": {
+        // {FIXED dims : body}: the body's aggregates over every row with the same dims, worked out once
+        const dims = n.dims.map(compile), body = compile(n.body);
+        let byRow = null;
+        return r => {
+          if (!byRow) {
+            const groups = new Map(), keyOf = q => dims.map(d => { const v = d(q); return v instanceof Date ? +v : String(v); }).join("\u0001");
+            rows.forEach((_, q) => { const k = keyOf(q); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(q); });
+            const val = new Map();
+            groups.forEach((g, k) => val.set(k, body(-1, g)));
+            byRow = rows.map((_, q) => val.get(keyOf(q)));
+          }
+          return byRow[r];
+        };
+      }
+      case "fn": return compileFn(n);
+      default: throw new Error("node");
+    }
+  };
+  const compileFn = n => {
+    const A = n.args.map(a => (a.t === "lit" ? () => a.v : null));
+    const args = () => n.args.map(compile);
+    if (SLICER_ROW_AGGS.has(n.name)) {
+      if (n.args.length !== 1) throw new Error("agg");
+      const a = compile(n.args[0]);
+      return (r, g) => {
+        if (!g) throw new Error("aggregate at row level");   // an aggregate calculation: not computed row by row
+        const vals = g.map(q => a(q, null)).filter(v => v !== null && v !== undefined);
+        if (n.name === "COUNT") return vals.length;
+        if (n.name === "COUNTD") return new Set(vals.map(v => (v instanceof Date ? +v : String(v)))).size;
+        if (n.name === "ATTR") return new Set(vals.map(v => (v instanceof Date ? +v : String(v)))).size === 1 ? vals[0] : null;
+        if (!vals.length) return null;
+        if (n.name === "MIN" || n.name === "MAX") {
+          const dates = vals[0] instanceof Date, ns = vals.map(num);
+          const m = n.name === "MIN" ? Math.min(...ns) : Math.max(...ns);
+          return dates ? new Date((m - 25569) * SLICER_DAY_MS) : m;
+        }
+        const ns = vals.map(num).filter(v => v !== null);
+        if (n.name === "SUM") return ns.reduce((s, v) => s + v, 0);
+        if (n.name === "AVG") return ns.reduce((s, v) => s + v, 0) / ns.length;
+        const sorted = ns.sort((x, y) => x - y), h = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[h] : (sorted[h - 1] + sorted[h]) / 2;
+      };
+    }
+    const f = args();
+    const one = fn => (r, g) => { const v = f[0](r, g); return v === null ? null : fn(v, r, g); };
+    const lit = k => { const v = A[k] ? A[k]() : null; if (v === null) throw new Error("literal"); return lower(v); };
+    switch (n.name) {
+      case "ZN": return (r, g) => num(f[0](r, g)) ?? 0;
+      case "IFNULL": return (r, g) => { const v = f[0](r, g); return v === null ? f[1](r, g) : v; };
+      case "ISNULL": return (r, g) => f[0](r, g) === null;
+      case "IIF": return (r, g) => { const c = f[0](r, g); return c === null ? (f[3] ? f[3](r, g) : null) : truthy(c) ? f[1](r, g) : f[2](r, g); };
+      case "ABS": return one(v => Math.abs(num(v)));
+      case "SIGN": return one(v => Math.sign(num(v)));
+      case "SQRT": return one(v => (num(v) < 0 ? null : Math.sqrt(num(v))));
+      case "ROUND": return (r, g) => { const v = num(f[0](r, g)), d = f[1] ? num(f[1](r, g)) || 0 : 0; return v === null ? null : Math.round(v * 10 ** d) / 10 ** d; };
+      case "INT": return one(v => Math.trunc(num(v)));
+      case "FLOOR": return one(v => Math.floor(num(v)));
+      case "CEILING": return one(v => Math.ceil(num(v)));
+      case "FLOAT": return one(v => num(v));
+      case "POWER": return (r, g) => { const a = num(f[0](r, g)), b = num(f[1](r, g)); return a === null || b === null ? null : a ** b; };
+      case "DIV": return (r, g) => { const a = num(f[0](r, g)), b = num(f[1](r, g)); return a === null || !b ? null : Math.trunc(a / b); };
+      case "STR": return one(v => (v instanceof Date ? v.toISOString().slice(0, 10) : typeof v === "number" ? String(+v.toPrecision(15)) : String(v)));
+      case "UPPER": return one(v => String(v).toUpperCase());
+      case "LOWER": return one(v => String(v).toLowerCase());
+      case "TRIM": return one(v => String(v).trim());
+      case "LEN": return one(v => String(v).length);
+      case "LEFT": return (r, g) => { const v = f[0](r, g); return v === null ? null : String(v).slice(0, num(f[1](r, g))); };
+      case "RIGHT": return (r, g) => { const v = f[0](r, g), k = num(f[1](r, g)); return v === null ? null : k > 0 ? String(v).slice(-k) : ""; };
+      case "MID": return (r, g) => { const v = f[0](r, g); if (v === null) return null; const s = num(f[1](r, g)) - 1; return f[2] ? String(v).substr(s, num(f[2](r, g))) : String(v).slice(s); };
+      case "CONTAINS": return (r, g) => { const v = f[0](r, g), s = f[1](r, g); return v === null || s === null ? null : String(v).includes(String(s)); };
+      case "STARTSWITH": return (r, g) => { const v = f[0](r, g), s = f[1](r, g); return v === null || s === null ? null : String(v).startsWith(String(s)); };
+      case "ENDSWITH": return (r, g) => { const v = f[0](r, g), s = f[1](r, g); return v === null || s === null ? null : String(v).endsWith(String(s)); };
+      case "YEAR": return one(v => part("year", dayOf(v)));
+      case "QUARTER": return one(v => part("quarter", dayOf(v)));
+      case "MONTH": return one(v => part("month", dayOf(v)));
+      case "DAY": return one(v => part("day", dayOf(v)));
+      case "DATE": return one(v => trunc("day", dayOf(v)));
+      case "DATETRUNC": { const p = lit(0); return (r, g) => trunc(p, dayOf(f[1](r, g))); }
+      case "DATEPART": { const p = lit(0); return (r, g) => part(p, dayOf(f[1](r, g))); }
+      case "DATEDIFF": {
+        const p = lit(0);
+        return (r, g) => {
+          const a = dayOf(f[1](r, g)), b = dayOf(f[2](r, g));
+          if (!a || !b) return null;
+          if (p === "day") return Math.round((+trunc("day", b) - +trunc("day", a)) / SLICER_DAY_MS);
+          if (p === "week") return Math.round((+trunc("week", b) - +trunc("week", a)) / (7 * SLICER_DAY_MS));
+          const months = (b.getUTCFullYear() - a.getUTCFullYear()) * 12 + b.getUTCMonth() - a.getUTCMonth();
+          return p === "month" ? months : p === "quarter" ? Math.floor((part("quarter", b) - part("quarter", a)) + (b.getUTCFullYear() - a.getUTCFullYear()) * 4) : p === "year" ? b.getUTCFullYear() - a.getUTCFullYear() : (() => { throw new Error("datepart"); })();
+        };
+      }
+      case "DATEADD": {
+        const p = lit(0);
+        return (r, g) => {
+          const k = num(f[1](r, g)), d = dayOf(f[2](r, g));
+          if (k === null || !d) return null;
+          if (p === "day") return new Date(+d + k * SLICER_DAY_MS);
+          if (p === "week") return new Date(+d + 7 * k * SLICER_DAY_MS);
+          const m = p === "month" ? k : p === "quarter" ? 3 * k : p === "year" ? 12 * k : (() => { throw new Error("datepart"); })();
+          return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + m, d.getUTCDate()));
+        };
+      }
+      default: throw new Error(`function ${n.name}`);
+    }
+  };
+  let values;
+  try {
+    const fn = compile(ast);
+    values = rows.map((_, r) => fn(r, null));
+  } catch (err) {
+    return -1;                                                  // an aggregate calculation, or something not computed
+  }
+  const kinds = new Set(values.filter(v => v !== null && v !== undefined).map(v => (v instanceof Date ? "date" : typeof v)));
+  const type = kinds.size === 1 ? { date: "date", number: "float", boolean: "boolean", string: "string" }[[...kinds][0]] : kinds.size ? "string" : "float";
+  const col = source.columns.length;
+  source.columns.push({ name: key, dataType: type, calc: true });
+  rows.forEach((row, r) => {
+    const v = values[r];
+    row[col] = v === null || v === undefined ? { value: null, nativeValue: null, formattedValue: "Null" }
+      : v instanceof Date ? { value: v.toISOString().slice(0, 10), nativeValue: v, formattedValue: v.toISOString().slice(0, 10) }
+      : { value: type === "string" ? String(v) : v, nativeValue: type === "string" ? String(v) : v, formattedValue: String(v) };
+  });
+  S.calcCols.set(key, col);
+  return col;
 }
 
 /** a filter's field name ("Region", "YEAR(Order Date)") → the field and its date part */
@@ -12231,6 +12717,11 @@ function slicerFilterField(fieldName) {
 function slicerMeasureExpr(source, model, ref) {
   if (!ref) return null;
   const deriv = String(ref.deriv || "").toLowerCase();
+  // percent of total (a quick table calculation over the whole view): the mark's value over every mark's
+  if (/^pcto/.test(deriv)) {
+    const base = tfTableCalcBase(ref), e = base && slicerMeasureExpr(source, model, base);
+    return e && !JSON.stringify(e).includes('"COUNTD"') ? { op: "pct", a: e } : null;
+  }
   if (SLICER_AGGS[deriv]) {
     const col = slicerColumnOf(source, model, ref);
     return col >= 0 ? { op: "agg", fn: SLICER_AGGS[deriv], col } : null;
@@ -12242,8 +12733,8 @@ function slicerMeasureExpr(source, model, ref) {
 /** a Tableau calculation of aggregations → SlicerExpr, null when it holds anything else */
 function slicerParseCalc(source, model, formula, depth) {
   if (depth > 4) return null;
-  const tokens = String(formula).replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ")
-    .match(/\[[^\]]+\]|[A-Za-z_]\w*|\d+(?:\.\d+)?|\S/g) || [];
+  const tokens = slicerTokenize(formula);
+  if (!tokens) return null;
   let i = 0;
   const fail = () => { throw new Error("not translatable"); };
   const expect = t => { if (tokens[i++] !== t) fail(); };
@@ -12272,11 +12763,25 @@ function slicerParseCalc(source, model, formula, depth) {
     const fn = t.toUpperCase();
     expect("(");
     if (fn === "ZN") { const e = expr(); expect(")"); return { op: "zn", a: e }; }
+    // TOTAL(SUM([Sales])): the aggregate over every mark of the visual (a table calculation over the whole view)
+    if (fn === "TOTAL") { const e = expr(); expect(")"); return JSON.stringify(e).includes('"COUNTD"') ? fail() : { op: "total", a: e }; }
     const agg = { SUM: "SUM", AVG: "AVG", MIN: "MIN", MAX: "MAX", COUNT: "COUNT", COUNTD: "COUNTD" }[fn];
-    const field = tokens[i++];
-    if (!agg || !field || field[0] !== "[") fail();
+    if (!agg) fail();
+    if (tokens[i] && tokens[i][0] === "[" && tokens[i + 1] === ")") {      // SUM([Sales])
+      const field = tokens[i++];
+      expect(")");
+      const col = slicerColumnOf(source, model, tfParseFieldRef(field));
+      return col >= 0 ? { op: "agg", fn: agg, col } : fail();
+    }
+    // SUM(IF [Year] = 2022 THEN [Sales] END), MIN(0): the expression computed row by row (slicerCalcColumn)
+    const start = i;
+    for (let depthP = 0; i < tokens.length; i++) {
+      if (tokens[i] === "(" || tokens[i] === "{") depthP++;
+      else if (tokens[i] === ")" || tokens[i] === "}") { if (!depthP) break; depthP--; }
+    }
+    const text = tokens.slice(start, i).join(" ");
     expect(")");
-    const col = slicerColumnOf(source, model, tfParseFieldRef(field));
+    const col = slicerCalcColumn(source, model, `(${text})`, text);
     return col >= 0 ? { op: "agg", fn: agg, col } : fail();
   };
   try {
@@ -12287,10 +12792,15 @@ function slicerParseCalc(source, model, formula, depth) {
 
 /** the expression's value over some source rows, as Tableau computes it (null: no value) @param {SlicerExpr} e
  * @param {number[]} rows indexes into source.rows @param {SlicerSource} source @returns {number | null} */
-function slicerEval(e, rows, source) {
+function slicerEval(e, rows, source, all) {
   if (e.op === "num") return /** @type {number} */ (e.v);
-  if (e.op === "zn") return slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source) ?? 0;
-  if (e.op === "neg") { const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source); return a === null ? null : -a; }
+  if (e.op === "zn") return slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source, all) ?? 0;
+  if (e.op === "neg") { const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source, all); return a === null ? null : -a; }
+  if (e.op === "total") return all ? slicerEval(/** @type {SlicerExpr} */ (e.a), all, source, all) : null;
+  if (e.op === "pct") {                                        // all: the rows of every mark of the visual
+    const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source, all), t = all ? slicerEval(/** @type {SlicerExpr} */ (e.a), all, source, all) : null;
+    return a === null || !t ? null : a / t;
+  }
   if (e.op === "agg") {
     const dvs = rows.map(r => source.rows[r][/** @type {number} */ (e.col)]).filter(dv => !tfIsNull(dv));
     if (e.fn === "COUNT") return dvs.length;
@@ -12301,7 +12811,7 @@ function slicerEval(e, rows, source) {
     if (e.fn === "AVG") return nums.reduce((s, n) => s + n, 0) / nums.length;
     return e.fn === "MIN" ? Math.min(...nums) : Math.max(...nums);
   }
-  const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source), b = slicerEval(/** @type {SlicerExpr} */ (e.b), rows, source);
+  const a = slicerEval(/** @type {SlicerExpr} */ (e.a), rows, source, all), b = slicerEval(/** @type {SlicerExpr} */ (e.b), rows, source, all);
   if (a === null || b === null) return null;
   if (e.op === "/") return b === 0 ? null : a / b;
   return e.op === "+" ? a + b : e.op === "-" ? a - b : a * b;
@@ -12313,6 +12823,9 @@ function slicerExcel(e, R, k) {
   if (e.op === "num") return String(e.v);
   if (e.op === "zn") return `IFERROR(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)},0)`;
   if (e.op === "neg") return `-(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)})`;
+  // percent of total: over the visible rows of every mark of the visual (any key)
+  if (e.op === "pct") return `(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)})/(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, '">0"')})`;
+  if (e.op === "total") return `(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, '">0"')})`;
   if (e.op === "agg") {
     const F = R.col(/** @type {number} */ (e.col)), on = `${R.key},${k},${R.vis},1`;
     switch (e.fn) {
@@ -12328,7 +12841,7 @@ function slicerExcel(e, R, k) {
 }
 
 /** an expression that can fail in Excel (a division, an average, min or max of no rows) */
-const slicerMayFail = e => !!e && (e.op === "/" || (e.op === "agg" && /^(AVG|MIN|MAX)$/.test(e.fn || "")) ||
+const slicerMayFail = e => !!e && (e.op === "/" || e.op === "pct" || (e.op === "agg" && /^(AVG|MIN|MAX)$/.test(e.fn || "")) ||
                                    slicerMayFail(e.a) || slicerMayFail(e.b));
 
 /**
@@ -12571,21 +13084,40 @@ function createSlicerModel() {
         if (!(deriv === "none" || deriv === "attr" || (isDate && SLICER_DATE_PARTS.has(deriv)))) return `"${label}" (${deriv}) cannot be matched to the rows`;
         return { col, deriv: deriv === "attr" ? "none" : deriv, isDate };
       };
+      // a dimension the rows do not have (a calculation, a constant such as "Total") is left out when the others
+      // still tell every mark apart – it then adds no marks of its own (a colour or label calculation per mark)
+      const dropped = [];
       for (let ci = 0; ci < vm.cols.length; ci++) {
         const c = vm.cols[ci];
         if (c.pivoted || generated(c)) continue;
         const deriv = String((c.ref && c.ref.deriv) || "none").toLowerCase();
         if (!c.isHeader && (!c.ref || SLICER_AGGS[deriv] || deriv === "usr")) continue;
         const h = headOf(c.ref, c.label || c.name);
-        if (typeof h === "string") return h;
+        if (typeof h === "string") {
+          if (!c.ref || slicerColumnOf(src, model, c.ref) < 0) { dropped.push({ ci, reason: h }); continue; }
+          return h;
+        }
         heads.push({ ci, ...h });
       }
-      // a matrix: the fields on Columns are in each value column's members (vm.cols[ci].matrixKey)
-      for (const ref of (vm.matrix && vm.matrix.colFields) || []) {
-        const h = headOf(ref, ref ? ref.name : "?");
-        if (typeof h === "string") return h;
-        colHeads.push(h);
+      if (dropped.length) {
+        const seen = new Map();
+        for (const r of vm.rows) {
+          const k = heads.map(h => slicerMarkText(r[h.ci], h.deriv, h.isDate)).join("\u0001");
+          const d = dropped.map(x => tfDvText(r[x.ci])).join("\u0001");
+          if (seen.has(k) && seen.get(k) !== d) return dropped.map(x => x.reason).join("; ");
+          seen.set(k, d);
+        }
       }
+      // a matrix: the fields on Columns are in each value column's members (vm.cols[ci].matrixKey)
+      // (a field the rows do not have – a colour calculation spread over columns – is left out: the check of every
+      // value against Tableau's below tells whether it split marks)
+      ((vm.matrix && vm.matrix.colFields) || []).forEach((ref, l) => {
+        const h = headOf(ref, ref ? ref.name : "?");
+        if (typeof h !== "string") colHeads.push({ ...h, l });
+        else if (ref && slicerColumnOf(src, model, ref) >= 0) colHeads.push({ fail: h });
+      });
+      const colFail = colHeads.find(h => h.fail);
+      if (colFail) return colFail.fail;
       // marks: one key per distinct combination of dimension values (a matrix cell: its row's and its column's)
       const ids = new Map();
       /** the mark of row r's value in column ci, or 0 when it cannot be told */
@@ -12594,14 +13126,14 @@ function createSlicerModel() {
         if (colHeads.length) {
           const mk = vm.cols[ci] && vm.cols[ci].matrixKey;
           if (!mk) return 0;
-          colHeads.forEach((h, l) => t.push(slicerMarkText(mk[l], h.deriv, h.isDate)));
+          colHeads.forEach(h => t.push(slicerMarkText(mk[h.l], h.deriv, h.isDate)));
         }
         if (t.some(x => x === null)) return 0;
         const key = t.join("\u0001");
         if (!ids.has(key)) ids.set(key, ids.size + 1);
         return /** @type {number} */ (ids.get(key));
       };
-      const valueCols = vm.cols.map((c, ci) => ci).filter(ci => !heads.some(h => h.ci === ci) && !generated(vm.cols[ci]));
+      const valueCols = vm.cols.map((c, ci) => ci).filter(ci => !heads.some(h => h.ci === ci) && !dropped.some(x => x.ci === ci) && !generated(vm.cols[ci]));
       vm.rows.forEach(r => valueCols.forEach(ci => idOf(r, ci)));
       // the sheet's other filters on the rows (a filter of a measure or a calculation applies to marks, not rows)
       const tests = [];
@@ -12625,6 +13157,7 @@ function createSlicerModel() {
       /** @type {Map<number, number[]>} the rows of each mark under Tableau's current selection */
       const rowsOf = new Map();
       keys.forEach((k, r) => { if (k && shown(r)) { if (!rowsOf.has(k)) rowsOf.set(k, []); /** @type {number[]} */ (rowsOf.get(k)).push(r); } });
+      const allRows = [...rowsOf.values()].flat();             // every mark's (a percent of total's whole)
 
       // each measure: translated, then checked mark by mark against Tableau's value
       /** @type {Map<number, { expr: SlicerExpr } | { reason: string }>} */
@@ -12636,7 +13169,7 @@ function createSlicerModel() {
         for (const r of vm.rows) {
           const t = tfDvNum(r[ci]);
           if (t === null) continue;
-          const v = slicerEval(expr, rowsOf.get(idOf(r, ci)) || [], src);
+          const v = slicerEval(expr, rowsOf.get(idOf(r, ci)) || [], src, allRows);
           if (v === null || Math.abs(v - t) > 1e-6 * Math.max(1, Math.abs(t))) {
             measures.set(ci, { reason: `${label}: the data source's rows give ${v === null ? "no value" : +v.toPrecision(6)} where Tableau shows ${tfDvText(r[ci])}` });
             return;
@@ -12663,19 +13196,41 @@ function createSlicerModel() {
        */
       const formula = (rows, ci, mode) => {
         const m = measures.get(ci);
-        if (!m || !("expr" in m) || !rows.length) return null;
+        if (!m || !("expr" in m)) return null;
+        return exprFormula(m.expr, rows, ci, mode);
+      };
+      /** "zero": a mark the slicers leave empty counts 0 (a waterfall step) */
+      const exprFormula = (expr, rows, ci, mode) => {
+        if (!rows.length) return null;
         const ks = [...new Set(rows.map(r => idOf(r, ci)))];
         if (ks.some(k => !k)) return null;
         if (keyCol < 0) keyCol = addColumn(`Key: ${sheetName}`, keys);
-        const empty = mode === "chart" ? "NA()" : '""';
+        const empty = mode === "chart" ? "NA()" : mode === "zero" ? "0" : '""';
         if (ks.length > 1) {                               // several marks summed into one value: only sums and counts add up
-          if (m.expr.op !== "agg" || !/^(SUM|COUNT)$/.test(m.expr.fn || "")) return null;
+          if (expr.op !== "agg" || !/^(SUM|COUNT)$/.test(expr.fn || "")) return null;
           const k = `{${ks.join(",")}}`;
-          return `IF(SUM(COUNTIFS(${R.key},${k},${R.vis},1))=0,${empty},SUM(${slicerExcel(m.expr, R, k)}))`;
+          return `IF(SUM(COUNTIFS(${R.key},${k},${R.vis},1))=0,${empty},SUM(${slicerExcel(expr, R, k)}))`;
         }
         const k = String(ks[0]);
-        const body = slicerExcel(m.expr, R, k);
-        return `IF(COUNTIFS(${R.key},${k},${R.vis},1)=0,${empty},${slicerMayFail(m.expr) ? `IFERROR(${body},${empty})` : body})`;
+        const body = slicerExcel(expr, R, k);
+        return `IF(COUNTIFS(${R.key},${k},${R.vis},1)=0,${empty},${slicerMayFail(expr) ? `IFERROR(${body},${empty})` : body})`;
+      };
+      /** a measure the visual does not show itself (a waterfall's step under its running total) – translated, and
+       * checked against the values Tableau's own numbers give for it: per value its marks' rows (groups), its number */
+      const extraExprs = new Map();
+      const checkedExpr = (ref, groups, ci, expected) => {
+        if (!extraExprs.has(ref.inner)) {
+          const expr = slicerMeasureExpr(src, model, ref);
+          const ok = !!expr && groups.every((rows, i) => {
+            if (expected[i] === null) return true;
+            const ks = [...new Set(rows.map(r => idOf(r, ci)))];
+            if (!rows.length || ks.some(k => !k)) return false;
+            const v = slicerEval(expr, ks.flatMap(k => rowsOf.get(k) || []), src, allRows);
+            return v !== null && Math.abs(v - expected[i]) <= 1e-6 * Math.max(1, Math.abs(expected[i]));
+          });
+          extraExprs.set(ref.inner, ok ? expr : null);
+        }
+        return extraExprs.get(ref.inner);
       };
       const reasons = [...measures.entries()].filter(([ci, m]) => !("expr" in m) && vm.order.includes(ci)).map(([, m]) => /** @type {any} */ (m).reason);
       console.log(`[Slicers] ${sheetName}: follows the slicers (${ids.size} marks, ${ok} measure${ok === 1 ? "" : "s"})` +
@@ -12692,6 +13247,14 @@ function createSlicerModel() {
         },
         /** the formula of the value of these rows' measure ci (a pie's slice, a label's measure); null: it stays fixed */
         formulaFor: (rows, ci, mode) => formula(rows, ci, mode),
+        /** formulas of a measure the visual does not show (ref) for each group of its rows (marks of column ci), when
+         * it gives Tableau's numbers (expected); null otherwise. mode as formulaFor's ("zero": an empty step is 0) */
+        measureFormulas(ref, groups, ci, expected, mode) {
+          const expr = checkedExpr(ref, groups, ci, expected);
+          if (!expr) return null;
+          const out = groups.map(rows => exprFormula(expr, rows, ci, mode));
+          return out.every(f => f) ? out : null;
+        },
         /** a chart value whose array knows its marks (values.src: tvSum) → its formula */
         valueFormula(values, i) {
           const s = values && values.src;
@@ -12787,7 +13350,11 @@ function bindPie(slicers, pie, sheetName, filters, model) {
   if (pie.valueCol < 0) return "its slices have no size measure";
   const rows = pie.points.map(p => pie.data[p.row]);
   const vm = /** @type {any} */ ({
-    cols: pie.columns.map(c => ({ name: c.name, label: c.name, ref: c.ref, isHeader: !c.numeric })),
+    // an aggregate is a measure even when Tableau gives it no number type (a calculation that is all null)
+    cols: pie.columns.map(c => {
+      const d = String((c.ref && c.ref.deriv) || "").toLowerCase();
+      return { name: c.name, label: c.name, ref: c.ref, isHeader: !c.numeric && !(SLICER_AGGS[d] || d === "usr") };
+    }),
     rows, order: [pie.valueCol], matrix: null
   });
   const binding = slicers.bind(vm, sheetName, filters, model);
@@ -12844,6 +13411,7 @@ function writeParamDateCard(worksheet, item, tracker, slicers) {
       const cell = worksheet.getCell(top, c0 + 1);
       cell.value = p.value;
       cell.font = dateCell.font;
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };   // white on any dashboard background
       cell.alignment = { horizontal: "left", vertical: "middle" };
       cell.border = { top: edge, left: edge, right: edge };
       cell.dataValidation = { type: "list", allowBlank: true, formulae: [slicers.listRef(p.list)], showErrorMessage: true,
@@ -13074,11 +13642,11 @@ async function exportToExcel() {
     const wbFile = formatModelFileName();
     const allName = wantAll && wbFile && loadedWorkbook().id ? String(wbFile).replace(/\.twbx?$/i, "") : null;
     const exportFileName = makeExportFileName(wbFile, allName || dashboard.name);
-    setExportStatus("Choose where to save the Excel file…");
-    const saveTarget = await chooseSaveTarget(exportFileName);       // opens in the loaded workbook's folder
-    if (saveTarget === "cancelled") { setExportStatus("Export cancelled – no file was saved"); return; }
+    // a new export replaces one not saved yet
+    pendingExport = null;
+    if (document.getElementById("save_button")) saveButton().hidden = true;
 
-    const tExport = performance.now();                 // timing starts after the save dialog (that waits on the user)
+    const tExport = performance.now();
     let tReadMs = 0;
     const titleMap = getTitleMap();
     console.log(`[Export] Using ${Object.keys(titleMap).length} titles`);
@@ -13165,18 +13733,7 @@ async function exportToExcel() {
     }
 
     const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    if (saveTarget) {
-      const writable = await saveTarget.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      console.log(`[Export] saved to ${saveTarget.name}`);
-    } else {
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = exportFileName;
-      link.click();
-      URL.revokeObjectURL(link.href);
-    }
+    const waitsForSave = offerSave(blob, exportFileName);           // saved by its own click, once complete
     // the panel's summary: every visual of every dashboard ("Dashboard / Sheet" when there are several), plus
     // where the file went and what was left out
     const multi = written.length > 1;
@@ -13185,7 +13742,7 @@ async function exportToExcel() {
     const workbookWarning = [...new Set(written.map(w => w.workbookWarning).filter(Boolean))].join(" · ");
     updateVisualStatus(visualStatuses, workbookWarning);
     appendExportStatus((multi ? `${written.length} dashboards, one sheet each – ` : "") +
-      (saveTarget ? `saved as ${saveTarget.name}` : `downloaded as ${exportFileName}`));
+      (waitsForSave ? "the Excel file is ready – click 💾 Save Excel file to save it" : `downloaded as ${exportFileName}`));
     const timing = `⏱ ${tReadMs ? `dashboards ${secs(tReadMs)} · ` : ""}sheets ${secs(tSheetsDone - tExport - tReadMs)} · ` +
       `file ${secs(performance.now() - tSheetsDone)} · total ${secs(performance.now() - tExport)}`;
     console.log(`[Timing] ${timing}`);
@@ -13904,6 +14461,11 @@ setTableVisibleRows(placedItems);
         specs.forEach((spec, k) => {
           if (item.vm.slicerBinding) {
             spec.valueFormula = item.vm.slicerBinding.valueFormula;
+            // a waterfall's bars are computed from its steps (cells of its own), not taken from the marks
+            if (/** @type {any} */ (spec).waterfall && bindWaterfall(spec, item.vm.slicerBinding)) {
+              spec.valueFormula = undefined;
+              delete spec.valueMin; delete spec.valueMax;              // Excel scales the axis to the steps shown
+            }
             // an axis range taken from Tableau's values would clip the values another selection gives: Excel scales it
             if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
             if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
