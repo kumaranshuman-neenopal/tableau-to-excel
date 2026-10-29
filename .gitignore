@@ -1,3 +1,4 @@
 .claude/
 *.zip
 Tableau-to-Excel-Coverage.pdf
+.vscode/
