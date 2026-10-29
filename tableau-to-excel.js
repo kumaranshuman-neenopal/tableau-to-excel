@@ -4533,7 +4533,7 @@ function buildPieCharts(pie, block, paneRefs, o) {
   };
   // bound to the slicers: the slices change size, so Excel draws the labels from their cells, the centre lines
   // showing the total link to theirs, and the tooltip wedges (cut at Tableau's angles) are left out
-  const bound = !!pie.slicerBinding;
+  const bound = !!pie.slicerBinding || !!pie.switched;
   /** centre lines stacked around the middle, one text box each; a line with a cell shows that cell's text */
   const centreBoxes = (lines, links) => {
     const lh = lines.map(l => Math.max(...l.map(x => (x.font && x.font.size) || 9), 1) * 1.25 * 96 / 72);
@@ -4566,7 +4566,7 @@ function buildPieCharts(pie, block, paneRefs, o) {
     }
     const labelFont = (pts.find(p => p.label && p.label.length && p.label[0].length) || { label: [[{ font: pie.font }]] }).label[0][0].font;
     const cellLabels = bound && pts.some(p => p.label) ? { range: sheetRef(refs.ref.sheet, refs.ref.lbl), texts: pts.map(p => p.label ? plainText(p.label) : ""), font: labelFont,
-      shifts: holeAsCircle || !holeD ? cellLabelShifts(pts, { cx: pw / 2, cy: ph / 2, R: D / 2, w: pw, h: ph }) : [] } : null;
+      shifts: !pie.switched && (holeAsCircle || !holeD) ? cellLabelShifts(pts, { cx: pw / 2, cy: ph / 2, R: D / 2, w: pw, h: ph }) : [] } : null;
     const x = M + cj * pw, y = ri * ph;
     const spec = {
       seriesName: pie.valueCaption, categories: pts.map(p => p.category), values: pts.map(p => p.value), ref: refs.ref,
@@ -10520,7 +10520,7 @@ function writeChartData(ws, spec, startRow) {
   // names turned on their side (categoryLabelFit) under a short chart: Excel leaves them about half its height and cuts
   // the rest down to a letter ("A.") – shortened here to what fits, a little of every word ("Mark. Asso."), as
   // Tableau's scrolling view shows them in full
-  if (spec.widthPx && spec.heightPx && spec.categories.levels.length === 1 && !spec.dateAxis) {
+  if (spec.widthPx && spec.heightPx && spec.categories.levels.length === 1 && !spec.dateAxis && !spec.keepNames) {
     const fit = categoryLabelFit(spec, { w: spec.widthPx * 0.85, h: spec.heightPx * 0.72 });
     if (fit && fit.rot) {
       const fontPx = (spec.font.size || 9) * 4 / 3, slot = spec.widthPx * 0.85 / Math.max(1, spec.categories.levels[0].length) * fit.skip;
@@ -10792,7 +10792,9 @@ function niceUnit(range, ticks) {
  * @returns {{ fixed: { min?: number, max?: number }, unit: number | null }}
  */
 function valueRange(spec, axisPlot) {
-  if (spec.percent) return { fixed: { min: 0, max: 1 }, unit: spec.valueMajorUnit || 0.2 };    // 100 % stacked: 0 – 100 %
+  // 100 % stacked: 0 – 100 %, a tick about every 55 px as Tableau's (a short plot: 0 %, 50 %, 100 %)
+  if (spec.percent) return { fixed: { min: 0, max: 1 }, unit: spec.valueMajorUnit ||
+    (axisPlot && axisPlot.h < SHORT_PLOT_PX ? niceUnit(1, Math.max(2, Math.round(axisPlot.h / 55))) : 0.2) };
   const fixed = { min: spec.valueMin, max: spec.valueMax };
   // values that follow slicers can grow past Tableau's: only the workbook's own range and spacing are kept, Excel
   // scales the rest (from zero when every value is positive, as Tableau's axis starts). Dots, targets and reference
@@ -11238,10 +11240,14 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
   // a hidden value axis beside a second axis group is kept, not drawn: Excel would draw a deleted axis's series on the
   // other group's axis, losing the scale Tableau gives each axis
   let axes = catAxis(spec, AX.cat, AX.val, { deleted: spec.categoryAxisHidden,
-                                     rot: (spec.categoryRotation || (spec.categoryFit ? spec.categoryFit.rot : 0)) * 60000, skip: spec.categoryFit ? spec.categoryFit.skip : 1 }) +
+                                     // switched views of other names (writeSwitchedChart): Excel turns them as each one needs
+                                     rot: spec.categoryAuto ? undefined : (spec.categoryRotation || (spec.categoryFit ? spec.categoryFit.rot : 0)) * 60000,
+                                     skip: spec.categoryFit ? spec.categoryFit.skip : 1 }) +
     valAxis(spec, AX.val, AX.cat, { title: spec.rowTitle !== undefined ? spec.rowTitle : spec.valueAxisHidden ? null : spec.valueTitle,
                                     titleFlat: spec.rowTitle !== undefined && !(spec.grid && spec.grid.rowVertical),
-                                    numFmt: spec.numFmt, values: axisValues(false), fixed,
+                                    // whole-percent ticks read as Tableau's axis: 0 %, 50 %, 100 %, not 50.0 %
+                                    numFmt: unit && /%/.test(spec.numFmt || "") && Math.abs(unit * 100 - Math.round(unit * 100)) < 1e-9
+                                      ? "0%" : spec.numFmt, values: axisValues(false), fixed,
                                     deleted: spec.valueAxisHidden && !hasSecondary && spec.rowTitle === undefined,
                                     hidden: spec.valueAxisHidden && (hasSecondary || spec.rowTitle !== undefined),
                                     majorUnit: unit, tickFmt: spec.valueAxisNumFmt, reversed: spec.valueReversed });
@@ -11755,6 +11761,8 @@ async function injectCharts(buffer, opts) {
     newNames.push(`<definedName name="${name}" hidden="1">${esc(ref)}</definedName>`);
     return name;
   };
+  // a switched chart's names (writeSwitchedChart): its ranges picked by the switch
+  charts.forEach(chart => (chart.names || []).forEach(n => newNames.push(`<definedName name="${n.name}">${esc(n.formula)}</definedName>`)));
   for (const chart of charts) {
     const rid = nextRelId(drawingRels);
     if (chart.spec.kind === "treemap") {
@@ -12224,6 +12232,273 @@ async function readSheet(ws, wrap, plain, hidden = false, domains = new Map(), s
     }
   }
   return snapshotSheet(ws.name, s);
+}
+
+/* ═══ export/view-switch.js ═══════════════════════════════════════════════════════════════════════ */
+/* Views a parameter's buttons switch between (Gender / Race) as ONE Excel chart that a dropdown switches, with no
+ * macros: the dropdown sits where Tableau's buttons are, and a cell of the chart data sheet holds its value (the
+ * switch). Every view writes its data as usual; the chart reads them through defined names –
+ * CHOOSE(MATCH(switch, {"Gender","Race"}, 0), the Gender view's range, the Race view's range) – so its categories
+ * change with the switch. Each series of every view is a series of its own (it keeps its colour): the views not
+ * picked read a column of #N/A, which Excel does not draw. A pie lists the slices of every view, each one #N/A
+ * while its view is not picked. The title and the legend line above the chart are formulas of the switch too. */
+
+/** what kind of chart a view is drawn as – views switch in one chart only when they are of one kind; null: it can't
+ * @param {any} item @returns {string | null} */
+function switchFamily(item) {
+  const vm = item && item.visualModel;
+  if (!vm || vm.gauge) return null;
+  // a pie: one pane; an inner layer only when it is a disc of one colour (a donut's centre), which stays as it is
+  if (vm.pie) return (vm.pie.inner && new Set(vm.pie.inner.points.map(p => String(p.color))).size > 1) ||
+    vm.pie.rowKeys.length * vm.pie.colKeys.length !== 1 ? null : "pie";
+  if (vm.renderer !== "excel-chart" || !vm.chartSpecs || vm.chartSpecs.length !== 1) return null;
+  const s = /** @type {any} */ (vm.chartSpecs[0]);
+  if (s.grid || s.waterfall || /^(scatter|bubble|treemap)$/.test(s.kind)) return null;
+  return [s.kind, s.barDir, !!s.stacked, !!s.percent, s.dateAxis ? "date" : ""].join("|");
+}
+
+/**
+ * A dashboard's switches: per parameter whose buttons switch views (the workbook's toggles), the view of each value –
+ * one chart each, all of one kind (switchFamily), one of them shown – and the buttons (sheets with its parameter
+ * action). Anything else (two charts per value, a table …) stays as withAlternateViews draws it.
+ * @param {any[]} items @param {any} dashM @param {Set<string>} alternates @param {FormatModel} model
+ * @param {string} dashName @param {(item: any) => string} zoneOf
+ */
+function findViewSwitches(items, dashM, alternates, model, dashName, zoneOf) {
+  /** @type {Map<string, Map<string, Set<string>>>} parameter → value → its zones */
+  const byParam = new Map();
+  Object.entries((dashM && dashM.toggles) || {}).forEach(([zone, t]) => {
+    if (!t.param || t.value === undefined) return;
+    if (!byParam.has(t.param)) byParam.set(t.param, new Map());
+    const values = byParam.get(t.param);
+    if (!values.has(t.value)) values.set(t.value, new Set());
+    values.get(t.value).add(zone);
+  });
+  const out = [];
+  byParam.forEach((values, param) => {
+    if (values.size < 2) return;
+    const views = [...values].map(([value, zones]) => ({ value, zones,
+      charts: items.filter(it => it.type === "worksheet" && zones.has(zoneOf(it)) && switchFamily(it)) }));
+    if (views.some(v => v.charts.length !== 1) || new Set(views.map(v => switchFamily(v.charts[0]))).size !== 1) return;
+    const shown = views.filter(v => !alternates.has(zoneOf(v.charts[0])));
+    if (shown.length !== 1) return;
+    const buttons = ((model && model.paramActions) || []).filter(a => a.param === param && (!a.dashboard || a.dashboard === dashName))
+      .map(a => items.find(it => it.name === a.worksheet)).filter(Boolean);
+    if (!buttons.length) return;
+    // text boxes the buttons switch too (a view's title): the shown one, and each value's at the same place across
+    const zoneAt = it => (dashM.zones || []).find(z => String(z.id) === zoneOf(it));
+    const textOf = it => it.textCard.tiles[0].lines.map(l => l.segments.map(sg => sg.text).join(""));
+    const texts = items.filter(it => it.textCard && shown[0].zones.has(zoneOf(it))).map(it => {
+      const z = zoneAt(it);
+      const byValue = views.map(v => {
+        if (v === shown[0]) return textOf(it);
+        const twins = items.filter(o => o.textCard && v.zones.has(zoneOf(o)) && zoneAt(o) && z && Math.abs(zoneAt(o).x - z.x) < 500);
+        twins.sort((a, b) => Math.abs(zoneAt(a).y - z.y) - Math.abs(zoneAt(b).y - z.y));
+        return twins.length ? textOf(twins[0]) : null;
+      });
+      return byValue.every(Boolean) ? { item: it, lines: byValue } : null;
+    }).filter(Boolean);
+    out.push({ texts,
+      param, value: shown[0].value, host: shown[0].charts[0], buttons,
+      views: views.map(v => ({ value: v.value, item: v.charts[0] })),
+      // the other values' zones (their charts, legends …) drawn below the dashboard until now: the switch shows them
+      dropped: items.filter(it => alternates.has(zoneOf(it)) && views.some(v => v.zones.has(zoneOf(it)))),
+      /** @type {any} */ sw: null
+    });
+  });
+  return out;
+}
+
+/** a string as an Excel formula literal */
+const xlText = s => `"${String(s).replace(/"/g, '""')}"`;
+
+/**
+ * The switch's cell on the chart data sheet (its value: the view shown; once the dropdown is written, a link to it).
+ * pick(parts) → a formula taking the part of the view picked.
+ * @param {import("exceljs").Worksheet} ds @param {number} row 0-based @param {any} group findViewSwitches
+ */
+function makeSwitch(ds, row, group) {
+  const values = group.views.map(v => v.value);
+  ds.getCell(row + 1, 1).value = `Switch: ${group.param.replace(/_\d{6,}$/, "")}`;
+  ds.getCell(row + 1, 1).font = { bold: true };
+  const cell = ds.getCell(row + 1, 2);
+  cell.value = group.value;
+  const ref = sheetRef(ds.name, `$B$${row + 1}`);
+  const idx = `MATCH(${ref},{${values.map(xlText).join(",")}},0)`;
+  return { cell, ref, values, pick: parts => `CHOOSE(${idx},${parts.join(",")})`,
+           is: value => `${ref}=${xlText(value)}` };
+}
+
+/**
+ * A pie whose views switch: each view's slices written as usual (writePieData), then one list of every view's slices
+ * – its value and label cells #N/A / empty unless its view is picked – that the chart draws, its labels from cells.
+ * Returns the panes (writePieData's) and the pie to draw (the shown view's, with every view's slices).
+ * @param {import("exceljs").Worksheet} ds @param {number} startRow 1-based @param {any} group @param {string} name
+ */
+function writeSwitchedPie(ds, startRow, group, name) {
+  const sw = group.sw;
+  const host = group.host.visualModel.pie;
+  let row = startRow;
+  const parts = group.views.map(v => {
+    const pie = v.item.visualModel.pie;
+    const data = writePieData(ds, row, pie, v.item.name);
+    row = data.nextRow;
+    return { value: v.value, pie, pane: [...data.panes.values()][0] };
+  });
+  ds.getCell(row, 1).value = `${name} (switched)`;
+  ds.getCell(row, 1).font = { bold: true };
+  ["Slice", "Value", "Label"].forEach((t, k) => { ds.getCell(row + 1, k + 1).value = t; });
+  const first = row + 2;
+  let r = first;
+  const cellOf = (range, i) => { const m = String(range).match(/\$([A-Z]+)\$(\d+)/); return `${m[1]}${+m[2] + i}`; };
+  const points = [];
+  parts.forEach(p => {
+    const shown = p.pie === host;
+    p.pie.points.forEach((pt, i) => {
+      ds.getCell(r, 1).value = pt.category;
+      ds.getCell(r, 2).value = { formula: `IF(${sw.is(p.value)},${cellOf(p.pane.ref.val, i)},NA())`, result: shown ? pt.value : { error: "#N/A" } };
+      ds.getCell(r, 3).value = { formula: `IF(${sw.is(p.value)},${cellOf(p.pane.ref.lbl, i)},"")`, result: shown && pt.label ? plainText(pt.label) : "" };
+      points.push({ ...pt, rowKey: host.rowKeys[0], colKey: host.colKeys[0], value: shown ? pt.value : null });
+      r++;
+    });
+  });
+  const last = r - 1;
+  const ref = { sheet: ds.name, cat: `$A$${first}:$A$${last}`, val: `$B$${first}:$B$${last}`, lbl: `$C$${first}:$C$${last}`,
+                total: `SUMIF($B$${first}:$B$${last},">0")` };
+  // the hole's text: each line the picked view's (its cell when it follows the slicers, else its text)
+  let centre = null;
+  const hostLines = host.hole && !host.centerText ? host.hole.labelFor(host.points) : null;
+  if (hostLines && hostLines.length) {
+    ds.getCell(r, 1).value = "Centre text";
+    centre = hostLines.map((line, li) => {
+      const texts = parts.map(p => {
+        const own = p.pie.hole ? p.pie.hole.labelFor(p.pie.points) : [];
+        const linked = p.pane.centre && p.pane.centre[li];
+        return linked || xlText(own[li] ? plainText([own[li]]) : "");
+      });
+      const cell = ds.getCell(r, li + 2);
+      cell.value = { formula: sw.pick(texts), result: plainText([line]) };
+      return sheetRef(ds.name, `$${getExcelColumnName(li + 1)}$${r}`);
+    });
+    r++;
+  }
+  const pie = { ...host, points, switched: true,
+                hole: host.hole ? { ...host.hole, labelFor: () => hostLines || [] } : null };
+  const innerRef = host.inner ? parts.find(p => p.pie === host).pane.innerRef : null;
+  return { panes: new Map([[host.rowKeys[0] + "\u0001" + host.colKeys[0], { ref, innerRef, centre }]]), pie, nextRow: r + 1 };
+}
+
+/**
+ * A chart whose views switch: each view's data written as usual (writeChartData, after prep: slicer formulas …) with
+ * a column of #N/A beside it, then the chart's spec – the shown view's, with every view's series – and its refs:
+ * defined names that pick the picked view's categories and each series' values (#N/A for the other views).
+ * @param {import("exceljs").Worksheet} ds @param {{ row: number, names?: number }} chartData @param {any} group
+ * @param {(item: any, spec: any) => void} prep
+ * @returns {{ spec: any, refs: any, names: { name: string, formula: string }[], parts: any[] }}
+ */
+function writeSwitchedChart(ds, chartData, group, prep) {
+  const sw = group.sw;
+  const id = chartData.names = (chartData.names || 0) + 1;
+  // views of other names (Department / Job Role): one axis shows each, so Excel fits them – the names kept whole
+  const levelsOf = v => JSON.stringify(/** @type {any} */ (v.item.visualModel.chartSpecs[0]).categories.levels);
+  const otherNames = new Set(group.views.map(levelsOf)).size > 1;
+  const parts = group.views.map(v => {
+    const spec = /** @type {any} */ (v.item.visualModel.chartSpecs[0]);
+    prep(v.item, spec);
+    if (otherNames) spec.keepNames = true;
+    const start = chartData.row;
+    const refs = writeChartData(ds, spec, start);
+    chartData.row = refs.nextRow;
+    const L = spec.categories.levels.length, N = L ? spec.categories.levels[0].length : 0;
+    const free = L + spec.series.length + spec.series.filter(s => s.labelTexts).length + (spec.helpers || []).length;
+    ds.getCell(start + 1, free + 1).value = "(not shown)";
+    for (let i = 0; i < N; i++) ds.getCell(start + 2 + i, free + 1).value = { formula: "NA()", result: { error: "#N/A" } };
+    return { value: v.value, item: v.item, spec, refs,
+             na: cellRef(ds.name, free, start + 1, free, start + Math.max(1, N)),
+             blank: cellRef(ds.name, free + 1, start + 1, free + 1, start + Math.max(1, N)) };
+  });
+  const host = parts.find(p => p.item === group.host);
+  const n = host.spec.categories.levels.length ? host.spec.categories.levels[0].length : 0;
+  const names = [{ name: `_Switch${id}_Categories`, formula: sw.pick(parts.map(p => p.refs.cat)) }];
+  const series = [], seriesRefs = [];
+  parts.forEach((p, k) => p.spec.series.forEach((s, j) => {
+    const r = p.refs.series[j];
+    const pick = (own, other) => sw.pick(parts.map((q, m) => (m === k ? own : other(q))));
+    const val = `_Switch${id}_S${series.length + 1}`;
+    names.push({ name: val, formula: pick(r.val, q => q.na) });
+    let lbl = null;
+    if (r.lbl) { lbl = `${val}_Labels`; names.push({ name: lbl, formula: pick(r.lbl, q => q.blank) }); }
+    const shown = p === host;
+    series.push({ ...s, values: shown ? s.values : new Array(n).fill(null),
+                  ...(s.labelTexts ? { labelTexts: shown ? s.labelTexts : new Array(n).fill("") } : {}) });
+    seriesRefs.push({ tx: r.tx, val: `[0]!${val}`, ...(lbl ? { lbl: `[0]!${lbl}` } : {}) });
+  }));
+  const spec = { ...host.spec, series };
+  // other names in another view (Department / Job Role): no rotation of the shown one's – Excel turns crowded names
+  if (otherNames && !host.spec.categoryRotation) spec.categoryAuto = true;
+  // an axis range of one view would clip another's values: kept only when every view has it
+  ["valueMin", "valueMax"].forEach(k => { if (parts.some(p => p.spec[k] !== host.spec[k])) delete spec[k]; });
+  return { spec, refs: { cat: `[0]!_Switch${id}_Categories`, series: seriesRefs }, names, parts };
+}
+
+/**
+ * The legend line above a switched chart: one cell per entry ("■ name"), each a formula of the switch, coloured by
+ * the picked view (conditional formatting) – entries placed across the chart's columns at the widest view's widths.
+ * false when the row has no room (something else in its cells): the chart keeps its own legend.
+ * @param {import("exceljs").Worksheet} ws @param {number} row 1-based @param {number} col 0-based first column
+ * @param {number[]} colPx the grid's column widths @param {number} widthPx @param {any[]} parts writeSwitchedChart's
+ * @param {any} sw @param {any} font
+ */
+function writeSwitchLegend(ws, row, col, colPx, widthPx, parts, sw, font) {
+  const entries = parts.map(p => {
+    const list = p.spec.series.filter(s => s.color && !s.refLine)
+      .map(s => ({ name: String(s.name), color: String(s.color).replace(/^#/, "").slice(-6).toUpperCase() }));
+    return p.spec.stacked && p.spec.barDir !== "bar" ? list.reverse() : list;       // stacked columns: the legend's order
+  });
+  const charPx = (font.size || 9) * 4 / 3 * 0.5;                 // Arial's average character
+  const slots = Math.max(...entries.map(e => e.length));
+  // too long for the chart's width: each entry an equal share, its name cut at the end ("South East As…", as Tableau)
+  const fullPx = n => (n.length + 3) * charPx + 10;
+  const total = Array.from({ length: slots }, (_, i) => Math.max(...entries.map(e => (e[i] ? fullPx(e[i].name) : 0)))).reduce((a, b) => a + b, 0);
+  const room = total > widthPx ? Math.max(4, Math.floor((widthPx / slots - 10) / charPx) - 3) : 0;
+  entries.forEach(e => e.forEach(x => { if (room && x.name.length > room) x.name = x.name.slice(0, room - 1).trimEnd() + "…"; }));
+  /** each column's left edge, px from the chart's */
+  const edges = [];
+  for (let c = col, x = 0; c < col + 400 && x <= widthPx; c++) { edges.push({ c, x }); x += colPx[c] || 0; }
+  // each entry in the column where its room begins (a cell's text runs on over the empty cells after it)
+  const cols = [];
+  for (let i = 0, x = 0; i < slots; i++) {
+    const at = [...edges].reverse().find(e => e.x <= x + 2 && (!cols.length || e.c > cols[cols.length - 1])) ||
+               edges.find(e => !cols.length || e.c > cols[cols.length - 1]);
+    const need = Math.max(...entries.map(e => (e[i] ? (e[i].name.length + 3) * charPx : 0))) + 10;
+    if (!at || (at.x + need > widthPx + 8 && cols.length)) break;
+    cols.push(at.c);
+    x = Math.max(x, at.x) + need;
+  }
+  if (!cols.length) return false;
+  // each name cut to the room its cell really has, up to the next entry's
+  const xOf = c => (edges.find(e => e.c === c) || { x: 0 }).x;
+  cols.forEach((c, i) => {
+    const roomPx = (i + 1 < cols.length ? xOf(cols[i + 1]) : widthPx) - xOf(c) - 6;
+    const fit = Math.max(3, Math.floor(roomPx / charPx) - 2);
+    entries.forEach(e => { if (e[i] && e[i].name.length > fit) e[i].name = e[i].name.replace(/…$/, "").slice(0, fit - 1).trimEnd() + "…"; });
+  });
+  for (let cc = col; cc <= Math.max(...cols) + 1; cc++) {
+    const v = ws.getCell(row, cc + 1).value;
+    if (v !== null && v !== undefined && v !== "") return false;
+  }
+  const shown = Math.max(0, parts.findIndex(p => p.value === sw.cell.value));
+  cols.forEach((cc, i) => {
+    const cell = ws.getCell(row, cc + 1);
+    cell.value = { formula: sw.pick(entries.map(e => xlText(e[i] ? `■ ${e[i].name}` : ""))),
+                   result: entries[shown][i] ? `■ ${entries[shown][i].name}` : "" };
+    cell.font = font;
+    cell.alignment = { vertical: "bottom", wrapText: false };
+    ws.addConditionalFormatting({ ref: cell.address, rules: parts.map((p, k) => entries[k][i] ? {
+      type: "expression", priority: k + 1, formulae: [sw.is(p.value)],
+      style: { font: { color: { argb: "FF" + entries[k][i].color } } } } : null).filter(Boolean) });
+  });
+  return true;
 }
 
 /* px between the dashboard and the views its buttons switch to, drawn below it (room for their header) */
@@ -14979,6 +15254,11 @@ setTableVisibleRows(placedItems);
     // the views the buttons switch to (withAlternateViews) start two rows under the dashboard's blocks: a row for
     // their header (the layout closes up empty rows, so the gap between them is not kept)
     const zoneOf = it => (it.layout && it.layout.id !== undefined ? String(it.layout.id) : "");
+    // views of one kind that a dropdown switches in one chart (findViewSwitches): the ones Tableau hides are not drawn
+    const switches = fmtModel ? findViewSwitches(adjustedItems, dashFmt, alternates, fmtModel, dashboard.name, zoneOf) : [];
+    const switchOf = new Map(switches.map(g => [g.host, g]));
+    switches.forEach(g => g.dropped.forEach(it => { const at = adjustedItems.indexOf(it); if (at >= 0) adjustedItems.splice(at, 1); }));
+    if (switches.length) console.log(`[Views] ${dashboard.name}: ${switches.map(g => g.views.map(v => v.item.visualName || v.item.name).join(" / ")).join(", ")} – one chart each, switched by a dropdown`);
     const altItems = adjustedItems.filter(it => alternates.has(zoneOf(it)));
     const dashEnd = Math.max(0, ...adjustedItems.filter(it => !alternates.has(zoneOf(it))).map(it => it.gridRow + Math.max(1, it.allocatedRows || 1)));
     if (altItems.length) {
@@ -14996,8 +15276,38 @@ setTableVisibleRows(placedItems);
     const writeGraphicTitle = item => {
       if (!item.vm.showTitle) return 0;
       writeTableauTitle(worksheet, item.gridRow, item.gridCol, item.vm.title.text, item.vm.title.props, item.gridW);
+      // switched views: the picked one's title
+      const group = switchOf.get(item);
+      const titles = group ? group.views.map(v => (v.item.vm && v.item.vm.showTitle ? v.item.vm.title.text : "") || "") : [];
+      if (group && group.sw && new Set(titles).size > 1)
+        worksheet.getCell(item.gridRow + 1, item.gridCol + 1).value = { formula: group.sw.pick(titles.map(xlText)), result: item.vm.title.text };
       return 1;
     };
+    /** a chart's spec before its data is written: its values as formulas of the slicers, fitted to its block */
+    const prepSpec = (item, spec, widthPx, heightPx) => {
+      if (item.vm.slicerBinding) {
+        const binding = item.vm.slicerBinding;
+        // a 100 % stacked chart without value labels: Excel draws each stack's shares itself from the base measure
+        const shares = !!spec.percent && !spec.series.some(s => s.labels || s.labelTexts);
+        spec.valueFormula = shares ? (values, i) => binding.valueFormula(values, i, true) : binding.valueFormula;
+        // a waterfall's bars are computed from its steps (cells of its own), not taken from the marks
+        if (/** @type {any} */ (spec).waterfall && bindWaterfall(spec, item.vm.slicerBinding)) {
+          spec.valueFormula = undefined;
+          delete spec.valueMin; delete spec.valueMax;              // Excel scales the axis to the steps shown
+        }
+        // an axis range taken from Tableau's values would clip the values another selection gives: Excel scales it
+        if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
+        if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
+      }
+      spec.widthPx = widthPx;                          // writeChartData fits category names to it
+      spec.heightPx = heightPx;
+    };
+    /** a switch's cell on the chart data sheet, made with its first chart */
+    const switchFor = group => {
+      if (!group.sw) { group.sw = makeSwitch(chartDataSheetOf(), chartData.row, group); chartData.row += 2; }
+      return group.sw;
+    };
+    const switchedNote = group => ` – switches between ${group.views.map(v => v.item.visualName || v.item.name).join(" / ")} with a dropdown, as Tableau's buttons do`;
 
     /** @type {{ item: ExportItem, top: number, panes: Map<string, any> }[]} pies, laid out with the final column widths */
     const pieJobs = [];
@@ -15028,15 +15338,19 @@ setTableVisibleRows(placedItems);
 
       if (item.visualModel && item.visualModel.pie) {
         const status = visualStatuses.find(entry => entry.worksheet === item.name);
+        const group = switchOf.get(item);
+        if (group) switchFor(group);
         const titleRows = writeGraphicTitle(item);
-        const data = writePieData(chartDataSheetOf(), chartData.row + 1, item.visualModel.pie, item.name);
+        const data = group ? writeSwitchedPie(chartDataSheetOf(), chartData.row + 1, group, item.visualName || item.name)
+          : writePieData(chartDataSheetOf(), chartData.row + 1, item.visualModel.pie, item.name);
         chartData.row = data.nextRow - 1;
-        pieJobs.push({ item, top: item.gridRow + titleRows, panes: data.panes });
+        pieJobs.push({ item, top: item.gridRow + titleRows, panes: data.panes, pie: group ? /** @type {any} */ (data).pie : null });
         reserveGraphicBlock(item);
         const pie = item.visualModel.pie;
         item.visualModel.status = "success";
         item.visualModel.statusReason = `native Excel ${pie.hole || pie.inner ? "donut" : "pie"} chart ` +
-          (pie.slicerBinding ? "following the slicers, its labels drawn by Excel from formula cells" : "with Tableau labels and tooltips");
+          (pie.slicerBinding ? "following the slicers, its labels drawn by Excel from formula cells" : "with Tableau labels and tooltips") +
+          (group ? switchedNote(group) : "");
         if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
         continue;
       }
@@ -15048,9 +15362,26 @@ setTableVisibleRows(placedItems);
 
       if (item.visualModel && item.visualModel.renderer === "excel-chart") {
         const status = visualStatuses.find(entry => entry.worksheet === item.name);
+        const group = switchOf.get(item);
+        if (group) switchFor(group);
         const titleRows = writeGraphicTitle(item);
         const specs = item.visualModel.chartSpecs;
         const paneH = Math.floor(item.box.heightPx / specs.length);     // separate panes stack vertically
+        if (group) {
+          const w = writeSwitchedChart(chartDataSheetOf(), chartData, group, (it, spec) => prepSpec(it, spec, item.box.widthPx, paneH));
+          // the legend line above it switches too
+          if (item.visualModel.legendStrip && w.spec.legend && item.gridRow > 0 &&
+              writeSwitchLegend(worksheet, item.gridRow, item.gridCol, grid.colPx, item.box.widthPx, w.parts, group.sw, tfExcelFont(item.vm.fmt.baseStyle())))
+            w.spec.legend = false;
+          chartJobs.push({ spec: w.spec, refs: w.refs, names: w.names, item, name: item.visualName || item.name,
+            col: item.gridCol, row: item.gridRow + titleRows, rowOffPx: 0, widthPx: item.box.widthPx, heightPx: paneH,
+            top: item.gridRow + titleRows, pane: 0, panes: 1 });
+          reserveGraphicBlock(item);
+          item.visualModel.status = "success";
+          item.visualModel.statusReason = `native Excel ${w.spec.kind} chart${switchedNote(group)}`;
+          if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
+          continue;
+        }
         // Tableau's colour legend in a strip above the view: one line of "■ name" in the row above the chart, in the
         // legend's order, cut with "…" where the chart's width ends (Tableau scrolls it); the chart then has none
         const lead = specs[0];
@@ -15076,22 +15407,7 @@ setTableVisibleRows(placedItems);
           }
         }
         specs.forEach((spec, k) => {
-          if (item.vm.slicerBinding) {
-            const binding = item.vm.slicerBinding;
-            // a 100 % stacked chart without value labels: Excel draws each stack's shares itself from the base measure
-            const shares = !!spec.percent && !spec.series.some(s => s.labels || s.labelTexts);
-            spec.valueFormula = shares ? (values, i) => binding.valueFormula(values, i, true) : binding.valueFormula;
-            // a waterfall's bars are computed from its steps (cells of its own), not taken from the marks
-            if (/** @type {any} */ (spec).waterfall && bindWaterfall(spec, item.vm.slicerBinding)) {
-              spec.valueFormula = undefined;
-              delete spec.valueMin; delete spec.valueMax;              // Excel scales the axis to the steps shown
-            }
-            // an axis range taken from Tableau's values would clip the values another selection gives: Excel scales it
-            if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
-            if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
-          }
-          spec.widthPx = item.box.widthPx;                 // writeChartData fits category names to it
-          spec.heightPx = paneH;
+          prepSpec(item, spec, item.box.widthPx, paneH);
           const refs = ExcelChartWriter.writeChartData(chartDataSheetOf(), spec, chartData.row);
           chartData.row = refs.nextRow;
           const offPx = k * paneH;
@@ -15196,6 +15512,54 @@ setTableVisibleRows(placedItems);
       }
     }
 
+    // ── the switches (findViewSwitches): Tableau's buttons become one dropdown of their values, on the shown value's
+    //    button; the switch cell the charts read links to it
+    const cellText = v => (v && typeof v === "object" ? (v.richText ? v.richText.map(t => t.text).join("") : v.text || "") : String(v ?? "")).trim();
+    const switched = switches.filter(g => g.sw);
+    switched.forEach(g => {
+      const lower = g.sw.values.map(v => String(v).toLowerCase());
+      let target = null;
+      const others = [];
+      g.buttons.forEach(button => {
+        for (let rr = button.gridRow; rr < button.gridRow + Math.max(1, button.allocatedRows); rr++) {
+          for (let cc = button.gridCol; cc < button.gridCol + Math.max(1, button.gridW); cc++) {
+            const cell = worksheet.getCell(rr + 1, cc + 1);
+            const t = cellText(cell.value).toLowerCase();
+            if (!lower.includes(t)) continue;
+            if (!target && t === String(g.value).toLowerCase()) target = cell;
+            else others.push(cell);
+          }
+        }
+      });
+      if (!target) target = others.shift() || worksheet.getCell(g.buttons[0].gridRow + 1, g.buttons[0].gridCol + 1);
+      others.forEach(c => { if (c !== target) c.value = null; });
+      target.value = g.value;
+      target.numFmt = '@" ▾"';                     // reads as a dropdown (the value itself stays the view's name)
+      target.dataValidation = { type: "list", allowBlank: false, formulae: [`"${g.sw.values.map(v => String(v).replace(/"/g, "")).join(",")}"`],
+                                showErrorMessage: true, errorTitle: "View", error: `Pick one of: ${g.sw.values.join(", ")}.` };
+      target.note = `Switches the view, as Tableau's buttons do: ${g.views.map(v => `${v.value} → ${v.item.visualName || v.item.name}`).join("; ")}`;
+      g.sw.cell.value = { formula: sheetRef(worksheet.name, target.address.replace(/([A-Z]+)(\d+)/, "$$$1$$$2")), result: g.value };
+    });
+    const switchedParams = new Set(switched.map(g => g.param));
+    // the text boxes they switch (a view's title): each line that differs, a formula of the switch
+    switched.forEach(g => g.texts.forEach(t => {
+      const it = t.item, shownLines = t.lines[g.views.findIndex(v => v.value === g.value)];
+      shownLines.forEach((text, li) => {
+        const options = t.lines.map(lines => lines[li] || "");
+        if (new Set(options).size < 2 || !text.trim()) return;
+        for (let rr = it.gridRow; rr < it.gridRow + Math.max(1, it.allocatedRows); rr++) {
+          for (let cc = it.gridCol; cc < it.gridCol + Math.max(1, it.gridW); cc++) {
+            const cell = worksheet.getCell(rr + 1, cc + 1);
+            if (cellText(cell.value) !== text.trim()) continue;
+            const font = cell.value && cell.value.richText && cell.value.richText[0] ? cell.value.richText[0].font : cell.font;
+            cell.value = { formula: g.sw.pick(options.map(xlText)), result: text };
+            if (font) cell.font = font;
+            return;
+          }
+        }
+      });
+    }));
+
     // ── the views the buttons switch to (withAlternateViews), below the dashboard: a header over them that links back
     //    up, and each button a link to the view it shows (Excel cannot switch them in place)
     if (altItems.length) {
@@ -15209,6 +15573,7 @@ setTableVisibleRows(placedItems);
       const dashM = fmtModel && fmtModel.dashboards[dashboard.name];
       const textOf = v => (v && typeof v === "object" ? (v.richText ? v.richText.map(t => t.text).join("") : v.text || "") : String(v ?? "")).trim();
       ((fmtModel && fmtModel.paramActions) || []).filter(a => !a.dashboard || a.dashboard === dashboard.name).forEach(a => {
+        if (switchedParams.has(a.param)) return;
         const button = adjustedItems.find(it => it.name === a.worksheet);
         const ref = a.field ? tfParseFieldRef(a.field) : null;
         const info = ref ? tfFieldInfo(fmtModel, ref) : null;
@@ -15491,14 +15856,14 @@ setTableVisibleRows(placedItems);
     const finalizeCharts = () => {
       /** @type {ChartJob[]} */
       const pieChartJobs = [];
-      pieJobs.forEach(({ item, top, panes, gauge }) => {
+      pieJobs.forEach(({ item, top, panes, gauge, pie }) => {
         let w = 0, h = 0;
         for (let c = item.gridCol; c < item.gridCol + item.gridW; c++) w += colPx(c);
         for (let r = top; r < item.gridRow + item.allocatedRows; r++) h += rowPx(r);
         const bg = (item.vm.fmt.tableBackground() || "FFFFFFFF").slice(2);
         const link = `#'${worksheet.name.replace(/'/g, "''")}'!${worksheet.getCell(top + 1, item.gridCol + 1).address}`;
         (gauge ? buildGaugeCharts(item.visualModel.gauge, { w, h }, panes, { name: item.visualName || item.name, bg })
-               : buildPieCharts(item.visualModel.pie, { w, h }, panes, { name: item.visualName || item.name, bg, link })).forEach(c => {
+               : buildPieCharts(pie || item.visualModel.pie, { w, h }, panes, { name: item.visualName || item.name, bg, link })).forEach(c => {
           const at = nativeAnchor(item.gridCol, top, c.x, c.y, colPx, rowPx);
           pieChartJobs.push({ spec: /** @type {any} */ ({ kind: "pie" }), refs: /** @type {any} */ (null), item, name: c.name,
             col: at.nativeCol, row: at.nativeRow, colOffPx: at.nativeColOff / 9525, rowOffPx: at.nativeRowOff / 9525,
