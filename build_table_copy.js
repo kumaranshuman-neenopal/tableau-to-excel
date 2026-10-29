@@ -5116,7 +5116,9 @@ function buildMapGaugeModel(model, sheetName, summary) {
 
     // the other layers: a needle (a line from the centre outwards) and text
     const toUnit = ([x, y]) => [(x - c.cx) / R, (y - c.cy) / R];
-    const wrap = a => { while (a < start - 180) a += 360; while (a > start + 180) a -= 360; return a; };
+    // an angle in the dial's own frame: within 180° of the dial's middle (a dial can sweep more than 180°)
+    const mid = start + span / 2;
+    const wrap = a => { while (a < mid - 180) a += 360; while (a > mid + 180) a -= 360; return a; };
     let needle = null, hub = null;
     const needleShape = shapes.find(sh => sh.role === "needle");
     if (needleShape) {
@@ -5168,7 +5170,8 @@ function buildMapGaugeModel(model, sheetName, summary) {
           const lines = renderTemplate(tpl, valueOf).map(line => line.map(x => ({ text: x.text, font: pieFont(pfmt.labelFont(x.props)) })));
           if (lines.length && lines.some(l => l.some(x => x.text.trim()))) {
             const [ux, uy] = toUnit(m.xy);
-            texts.push({ x: ux, y: uy, lines });
+            // cull: "Allow labels to overlap other marks" is off – Tableau hides such a label rather than overlap
+            texts.push({ x: ux, y: uy, lines, cull: pfmt.markLabelsCulled() });
           }
         });
       }
@@ -5294,18 +5297,30 @@ function buildGaugeCharts(gauge, block, refs, o) {
   const cx = Math.max(-x0 * k, Math.min(w - x1 * k, w / 2 - (ex.x0 + ex.x1) / 2 * k));
   const cy = Math.max(cyMin, Math.min(cyMax, h / 2 + (ex.y0 + ex.y1) / 2 * k));
   const texts = [];
-  const textScale = FORMAT_CONFIG.tableauTextScale || (typeof window !== "undefined" && window.devicePixelRatio) || 1;
-  gauge.texts.forEach(t => {
-    const lines = t.lines;
-    const sizes = lines.flatMap(l => l.map(x => x.font.size || 9));
-    const pt = Math.max(...sizes, 9);
-    const px = pt * 96 / 72 * textScale;
-    const tw = Math.max(...lines.map(l => l.reduce((s, x) => s + textWidthPx(x.text, x.font, (x.font.size || 9) * 96 / 72 * textScale), 0))) + 6;
-    const th = lines.length * px * LABEL_LINE_EM;
+  // Tableau's map fits the marks into the whole zone; Excel's dial is often smaller (the whole circle, hidden half
+  // included, must fit in the chart). The text shrinks by the same ratio, so labels keep Tableau's spacing.
+  const kTableau = Math.min(w / (x1 - x0), h / (y1 - y0));
+  const ratio = Math.min(1, k / (kTableau || k));
+  const scaled = f => ({ ...f, size: Math.max(6, Math.round((f.size || 9) * ratio * 2) / 2) });
+  // boxes as Excel draws the text (points at 96 dpi – the screen's scaling does not apply inside Excel)
+  const boxes = gauge.texts.map((t, order) => {
+    const lines = t.lines.map(l => l.map(x => ({ ...x, font: scaled(x.font) })));
+    const pt = Math.max(...lines.flatMap(l => l.map(x => x.font.size)), 6);
+    const tw = Math.max(...lines.map(l => l.reduce((s, x) => s + textWidthPx(x.text, x.font, x.font.size * 96 / 72), 0))) + 4;
+    const th = lines.length * pt * 96 / 72 * LABEL_LINE_EM;
     const x = cx + t.x * k, y = cy - t.y * k;
-    texts.push({ x: Math.max(0, Math.min(w - tw, x - tw / 2)), y: Math.max(0, Math.min(h - th, y - th / 2)), w: tw, h: th,
-                 lines, anchor: "ctr", align: "ctr" });
+    return { x: Math.max(0, Math.min(w - tw, x - tw / 2)), y: Math.max(0, Math.min(h - th, y - th / 2)), w: tw, h: th,
+             lines, anchor: "ctr", align: "ctr", cull: t.cull !== false, pt, order };
   });
+  // Tableau hides a label that would overlap another rather than draw them on top of each other ("Allow labels to
+  // overlap other marks" off): labels that must show first, then the bigger text, then Tableau's order
+  const overlap = (a, b) => a.x < b.x + b.w - 1 && b.x < a.x + a.w - 1 && a.y < b.y + b.h - 1 && b.y < a.y + a.h - 1;
+  const placed = [];
+  boxes.slice().sort((a, b) => (a.cull - b.cull) || (b.pt - a.pt) || (a.order - b.order)).forEach(b => {
+    if (b.cull && placed.some(p => overlap(b, p))) { tfLog(`Gauge: label "${b.lines.flat().map(x => x.text).join("").trim()}" hidden – it would overlap another, as in Tableau`); return; }
+    placed.push(b);
+  });
+  placed.sort((a, b) => a.order - b.order).forEach(({ cull, pt, order, ...box }) => texts.push(box));
   if (gauge.hub || gauge.needle) {                             // the pivot: Tableau's hub, else a small disc in the needle's colour
     const hub = gauge.hub ? Math.max(6, D * gauge.hub.ratio) : Math.max(6, D * 0.05);
     texts.push({ x: cx - hub / 2, y: cy - hub / 2, w: hub, h: hub, shape: "ellipse", fill: gauge.hub ? gauge.hub.color : gauge.needle.color, lines: [] });
@@ -12005,8 +12020,65 @@ function snapshotSheet(name, s) {
     getSummaryDataAsync: answer(s.summary, s.summaryError),
     getVisualSpecificationAsync: answer(s.visualSpec, s.visualSpec ? null : (s.visualSpecError || new Error("getVisualSpecificationAsync is unavailable"))),
     getFiltersAsync: async () => s.filters || [],
-    getSelectedMarksAsync: async () => ({ data: s.selected || [] })
+    getSelectedMarksAsync: async () => ({ data: s.selected || [] }),
+    // slicers read the rows of a filtered field's data source: the live worksheet's own (this dashboard stays
+    // open), or the copies read while a hidden view was open (another dashboard: its view is closed by now)
+    ...(s.live && typeof s.live.getDataSourcesAsync === "function" ? { getDataSourcesAsync: () => s.live.getDataSourcesAsync() }
+      : s.dataSources ? { getDataSourcesAsync: async () => s.dataSources } : {})
   };
+}
+
+/**
+ * Copies of a worksheet's data sources that have one of its filtered fields – read now, while a hidden view is open
+ * (it is closed before the slicers are made). Every logical table's rows (at most FORMAT_CONFIG.slicerMaxRows + 1
+ * each, so "too many rows" is still told): of related tables the slicers pick the one that holds the field
+ * (readSlicerSource). Each data source is read once per dashboard (cache). Never throws: no copy → the filter card
+ * stays a card.
+ * @param {any} ws @param {any[]} filters @param {Map<string, Promise<any>>} cache @returns {Promise<any[] | null>}
+ */
+async function freezeDataSources(ws, filters, cache) {
+  if (!FORMAT_CONFIG.slicers || typeof ws.getDataSourcesAsync !== "function") return null;
+  const filtered = (filters || []).filter(f => f && /^(categorical|range|relative-?date)$/i.test(String(f.filterType || "")) &&
+                                                !/^Measure (Names|Values)$/.test(f.fieldName || "")).map(f => tfNorm(f.fieldName));
+  if (!filtered.length) return null;
+  let sources = [];
+  try { sources = (await ws.getDataSourcesAsync()) || []; } catch (e) { return null; }
+  const out = [];
+  for (const ds of sources) {
+    const fields = (ds.fields || []).map(f => ({ name: f.name }));
+    if (!fields.some(f => filtered.includes(tfNorm(f.name)))) continue;      // no filtered field: not needed
+    if (!cache.has(ds.id)) {
+      cache.set(ds.id, (async () => {
+        const tables = typeof ds.getLogicalTablesAsync === "function" ? await ds.getLogicalTablesAsync() : [];
+        const max = FORMAT_CONFIG.slicerMaxRows + 1;
+        /** @type {Map<string, { columns: any[], data: any[] }>} each table's rows (related tables: all of them) */
+        const rows = new Map();
+        for (const t of tables) {
+          let table = null;
+          if (typeof ds.getLogicalTableDataReaderAsync === "function") {
+            const reader = await ds.getLogicalTableDataReaderAsync(t.id, 10000, { ignoreAliases: false });
+            try { table = reader.totalRowCount > max ? { columns: [], data: new Array(reader.totalRowCount) } : await reader.getAllPagesAsync(max); }
+            finally { await reader.releaseAsync(); }
+          } else if (typeof ds.getLogicalTableDataAsync === "function") {
+            table = await ds.getLogicalTableDataAsync(t.id, { ignoreAliases: false, maxRows: max });
+          }
+          if (table) rows.set(t.id, { columns: (table.columns || []).map(c => ({ fieldName: c.fieldName, dataType: c.dataType })), data: table.data || [] });
+        }
+        const plainTables = tables.map(t => ({ id: t.id, caption: t.caption }));
+        return { id: ds.id, name: ds.name, fields,
+                 getLogicalTablesAsync: async () => plainTables,
+                 // the copy answers as Tableau would (the reader's row count tells "too many rows"); maxRows: a first look
+                 getLogicalTableDataAsync: async (id, opts) => {
+                   const table = rows.get(id);
+                   if (!table) throw new Error("its rows were not read");
+                   return opts && opts.maxRows && table.data.length > opts.maxRows ? { ...table, data: table.data.slice(0, opts.maxRows) } : table;
+                 } };
+      })().catch(e => { console.warn(`[Slicers] could not read "${ds.name}" while its dashboard was open:`, e.message); return null; }));
+    }
+    const copy = await cache.get(ds.id);
+    if (copy) out.push(copy);
+  }
+  return out.length ? out : null;
 }
 
 /** Reads one worksheet completely: data, visual specification, filters, selected marks.
@@ -12036,8 +12108,8 @@ async function allSelectedFields(raw, wrap, domains) {
   return all;
 }
 
-async function readSheet(ws, wrap, plain, hidden = false, domains = new Map()) {
-  const s = { summary: null, summaryError: null, visualSpec: null, visualSpecError: null, filters: [], selected: [] };
+async function readSheet(ws, wrap, plain, hidden = false, domains = new Map(), sources = new Map()) {
+  const s = { summary: null, summaryError: null, visualSpec: null, visualSpecError: null, filters: [], selected: [], live: null, dataSources: null };
   const readFilters = async () => {
     try {
       const raw = (await wrap(ws.getFiltersAsync(), `Filters of "${ws.name}"`)) || [];
@@ -12071,11 +12143,14 @@ async function readSheet(ws, wrap, plain, hidden = false, domains = new Map()) {
     await readSummary();
     await readSpec();
     await readFilters();
+    // the rows of the data sources its filters use: read now, while the hidden view is open
+    try { s.dataSources = await freezeDataSources(ws, s.filters, sources); } catch (e) { s.dataSources = null; }
     // a freshly opened hidden viz has nothing selected: its selected marks are always empty – not asked for
   } else {
     // The live dashboard (Extensions API): data + visual specification together, as fetchAllSheetsData does.
     await Promise.all([readSummary(), readSpec()]);
     await readFilters();
+    s.live = ws;                                        // this dashboard stays open: its data sources are read when needed
     if (typeof ws.getSelectedMarksAsync === "function") {
       try {
         const marks = await wrap(ws.getSelectedMarksAsync(), `Selected marks of "${ws.name}"`);
@@ -12127,13 +12202,15 @@ async function readSheets(worksheets, wrap, plain, objects, dashName) {
   const hidden = hiddenWorksheetNames(objects, dashName);
   /** @type {Map<string, Promise<number>>} each filtered field's value count, asked once for the dashboard */
   const domains = new Map();
+  /** @type {Map<string, Promise<any>>} the data sources copied for slicers, each read once for the dashboard */
+  const sources = new Map();
   const list = [...(worksheets || [])];
   const out = new Array(list.length);
   let next = 0;
   const worker = async () => {
     while (next < list.length) {
       const i = next++;
-      out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name), domains);
+      out[i] = await readSheet(list[i], wrap, plain, hidden.has(list[i].name), domains, sources);
     }
   };
   const lanes = plain ? 1 : SHEET_READ_CONCURRENCY;
