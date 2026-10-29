@@ -243,6 +243,8 @@ const FORMAT_CONFIG = {
   slicers: true,                  // a filter card of a field's values → an Excel slicer that filters every chart, table and KPI value
                                   // built from the same data source (their numbers become formulas over its rows, a hidden sheet)
   slicerMaxRows: 200000,          // a data source with more rows keeps its filter cards as text (the file would get too big and slow)
+  dropdownCards: true,            // a Tableau dropdown card (Multiple Values (dropdown) too) → a dropdown cell, (All) or one value,
+                                  // like the card; false: a slicer. A card with several – not all – values selected stays a slicer
   showTiming: false,              // true: also show the "⏱ dashboards … · sheets … · file …" line in the panel (always in the console)
   debug: false                    // true: dump the parsed workbook model, [Format] traces and full visual specs to the console
 };
@@ -525,6 +527,21 @@ function tvApplyWorkbookAxes(spec, ctx) {
   const dims = [...roles[valueShelf].dims.map(d => ({ d, shelf: valueShelf })), ...roles[catShelf].dims.map(d => ({ d, shelf: catShelf }))];
   const hidden = ({ d, shelf }) => !!d.ref && (d.continuous ? fmt.axisInfo(d.ref, shelf, "0").hidden === true : fmt.isLabelHidden(d.ref));
   if (dims.length && dims.every(hidden)) spec.categoryAxisHidden = true;
+  // one header hidden among shown ones (Department shown, the colour's Race under it hidden): that level's labels
+  // are left blank – Tableau draws no header row for it, and its many labels would overlap. A space, not "": with
+  // empty cells Excel drops the multi-level axis, and Department sits under its first bar instead of its group
+  else if (spec.categories && spec.categories.levels.length > 1) {
+    const blank = new Set(roles[catShelf].dims.filter(d => d.ref && !d.continuous && fmt.isLabelHidden(d.ref))
+      .map(d => spec.categories.names.indexOf(tvMeasureLabel(vm, d.ci))).filter(l => l >= 0));
+    if (blank.size && blank.size < spec.categories.levels.length) {
+      spec.categories = { ...spec.categories, levels: spec.categories.levels.map((lv, l) => (blank.has(l) ? lv.map(() => " ") : lv)),
+                          blankLevels: [...blank] };
+    }
+  }
+  // a continuous category (a date axis): Edit Axis → its title ("" = none – a sparkline's axis keeps its room for the dates)
+  const axisDim = roles[catShelf].dims.find(d => d.ref && d.continuous);
+  const catTitle = axisDim ? fmt.axisInfo(axisDim.ref, catShelf, "0").title : undefined;
+  if (catTitle !== undefined) spec.categoryTitle = catTitle;
   // category labels: horizontal like Tableau's column headers, unless the header is rotated in the workbook
   const inner = roles[catShelf].dims.filter(d => d.ref && !d.continuous).slice(-1)[0];
   const rot = inner ? fmt.headerOrientation(inner.ref) : null;
@@ -1808,7 +1825,7 @@ function tfCalcInfo(calc) {
 
 /* Raise when the parser reads something new: a workbook model remembered by an older version is then
    parsed again from its stored XML (ui/workbook-store.js), so an update reaches workbooks loaded before it. */
-const FORMAT_MODEL_VERSION = 8;
+const FORMAT_MODEL_VERSION = 9;
 
 /** @param {string} xmlString the .twb XML @returns {FormatModel} */
 function parseTableauFormatting(xmlString) {
@@ -1991,6 +2008,7 @@ function parseTableauFormatting(xmlString) {
         id: c.getAttribute("id"), name: c.getAttribute("name") || undefined,
         type: c.getAttribute("type-v2") || "worksheet",
         showTitle: c.getAttribute("show-title") !== "false",
+        customTitle: c.getAttribute("custom-title") === "true" || undefined,   // runs: the title shown instead of the field's
         hidden: c.getAttribute("hidden-by-user") === "true",
         x: tfNum(c.getAttribute("x")), y: tfNum(c.getAttribute("y")),
         w: tfNum(c.getAttribute("w")), h: tfNum(c.getAttribute("h")),
@@ -2008,12 +2026,47 @@ function parseTableauFormatting(xmlString) {
     });
     walk(tfKid(d, "zones"), undefined);   // direct child only → phone/tablet layouts are skipped
     const size = tfKid(d, "size");
+    const sid = tfKid(d, "simple-id");
     model.dashboards[d.getAttribute("name")] = {
       title: tfParseTitle(d), style: tfParseStyle(tfKid(d, "style")), zones,
+      uuid: sid ? sid.getAttribute("uuid") || undefined : undefined,
+      toggles: {},                          // zone id → the boolean field that shows it (dynamic zone visibility, below)
       width: size ? tfNum(size.getAttribute("maxwidth")) : undefined,
       height: size ? tfNum(size.getAttribute("maxheight")) : undefined
     };
   });
+
+  // ── dynamic zone visibility (Layout → Control visibility using value): a zone is shown while a boolean field is
+  //    True. <datagraph>: a zone's visibility input ← a field node's value output. The field usually tests a parameter
+  //    ([Parameters].[Parameter 1]='Race') that buttons set (parameter actions): the zone is one of the views they
+  //    switch between. dashboards[d].toggles[zone id] = { field, param, value } (param / value: when it is such a test)
+  const graph = tfKid(tfKid(root, "datagraph"), "graph");
+  if (graph) {
+    const nodes = tfKids(tfKid(graph, "nodes"));
+    const fieldOfOutput = new Map(nodes.filter(n => n.tagName === "single-value-field-node")
+      .map(n => [n.getAttribute("value-output-guid"), n.getAttribute("fieldname")]));
+    const fromOf = new Map(tfKids(tfKid(graph, "edges"), "edge").map(e => [e.getAttribute("to"), e.getAttribute("from")]));
+    nodes.filter(n => n.tagName === "dashboard-zone-visibility-node").forEach(n => {
+      const dash = Object.values(model.dashboards).find(x => x.uuid && x.uuid === n.getAttribute("dashboard-identifier"));
+      const field = fieldOfOutput.get(fromOf.get(n.getAttribute("visibility-input-guid")) || "");
+      if (!dash || !field) return;
+      const ref = tfParseFieldRef(field);
+      const info = ref && tfFieldInfo(model, ref);
+      const test = info && String(info.formula || "").trim()
+        .match(/^\[Parameters\]\.\[([^\]]+)\]\s*==?\s*(?:'((?:[^']|'')*)'|"((?:[^"]|"")*)")$/);
+      const value = test && (test[2] !== undefined ? test[2].replace(/''/g, "'") : test[3].replace(/""/g, '"'));
+      dash.toggles[n.getAttribute("zone-id")] = tfDefined({ field, param: test ? test[1] : undefined, value: test ? value : undefined });
+    });
+  }
+  // ── parameter actions (a click on a sheet's mark sets a parameter: the "buttons" of a dashboard)
+  model.paramActions = tfKids(tfKid(root, "actions"), "edit-parameter-action").map(a => {
+    const src = tfKid(a, "source");
+    const p = name => { const x = tfKids(tfKid(a, "params"), "param").find(q => q.getAttribute("name") === name); return x ? x.getAttribute("value") || "" : ""; };
+    const target = p("target-parameter").match(/^\[Parameters\]\.\[(.+)\]$/);
+    return tfDefined({ dashboard: src ? src.getAttribute("dashboard") || undefined : undefined,
+                       worksheet: src ? src.getAttribute("worksheet") || undefined : undefined,
+                       param: target ? target[1] : undefined, field: p("source-field") || undefined });
+  }).filter(a => a.worksheet && a.param);
 
   // ── each sheet's fit on each dashboard (<window class='dashboard'> viewpoints: "entire-view", "fit-width" …)
   tfKids(tfKid(root, "windows"), "window").forEach(w => {
@@ -2397,6 +2450,27 @@ function tvReferenceLabelFormat(rl, valueFmt) {
   return rl.formula === "constant" ? positive : lit(name);
 }
 
+/* AGGREGATE's function per computation; option 6 skips errors – a mark the slicers leave empty is #N/A. In the file
+ * it is _xlfn.AGGREGATE (an Excel 2010 function): bare, Excel reads an unknown function and shows #NAME? */
+const REFLINE_AGGREGATE = { average: 1, mean: 1, max: 4, min: 5, sum: 9, total: 9, median: 12 };
+
+/**
+ * A reference line over series that follow the slicers: each of its cells computed from those series' cells
+ * (writeChartData's cellFormula), so the line and its label move with them. null (Tableau's value stays) when the
+ * series keep fixed values or the computation is a constant.
+ * @param {ChartSpec} spec @param {ReferenceLine} rl @param {any[]} data the series the line is computed over
+ */
+function refLineFormula(spec, rl, data) {
+  const fn = REFLINE_AGGREGATE[rl.formula];
+  if (!fn || !data.length) return null;
+  return (i, at) => {
+    const follows = data.some(s => s.cellFormula) || (spec.valueFormula && data.some(s => s.values && s.values.src));
+    const n = spec.categories.levels[0].length, ks = data.map(s => spec.series.indexOf(s));
+    if (!follows || !n || ks.some(k => k < 0)) return null;
+    return `_xlfn.AGGREGATE(${fn},6,${ks.map(k => `${at("series", k, 0)}:${at("series", k, n - 1)}`).join(",")})`;
+  };
+}
+
 /**
  * Adds the worksheet's reference lines (table / pane scope) on the value axis: a flat line series on a
  * vertical value axis, or spec.refLines for horizontal bars (the writer draws those across the bars).
@@ -2449,7 +2523,8 @@ function tvApplyReferenceLines(spec, ctx) {
     // drawn on its measure's axis: on a dual-axis chart that may be the secondary one
     else spec.series.push({ name: line.name, type: "line", color: line.color, line: !hidden,
                             ...(data.length && data.every(s => s.secondary) ? { secondary: true } : {}),
-                            marker: false, labels: false, values: spec.categories.levels[0].map(() => value), refLine: line });
+                            marker: false, labels: false, values: spec.categories.levels[0].map(() => value), refLine: line,
+                            cellFormula: refLineFormula(spec, rl, data) });
   });
   if (left) {
     const c = spec.conversion;
@@ -10309,11 +10384,31 @@ function writeChartData(ws, spec, startRow) {
     return { series, nextRow: startRow + maxLen + 3 };
   }
 
+  // a group's name over a hidden level (Job Role over its races): Excel wraps it at spaces within the group's width,
+  // but a word longer than that runs into the next one – cut short with "…", as Tableau cuts its header
+  const blanks = spec.categories.blankLevels || [];
+  const groups = levelStarts(spec.categories.levels);           // from the full names: two cut alike stay two groups
+  spec.categories.starts = groups;
+  if (blanks.length && spec.widthPx) {
+    const lv0 = spec.categories.levels, n = lv0[0].length;
+    const charPx = (spec.font.size || 9) * 4 / 3 * 0.5, slot = spec.widthPx * 0.9 / Math.max(1, n);   // Arial's average character
+    spec.categories.levels = lv0.map((lv, l) => {
+      if (blanks.includes(l) || l === lv0.length - 1) return lv;
+      const starts = groups[l];
+      return lv.map((name, i) => {
+        if (!starts[i]) return name;
+        let size = 1;
+        while (i + size < n && !starts[i + size]) size++;
+        const room = Math.max(1, Math.floor((slot * size - 4) / charPx));
+        return String(name).split(/\s+/).some(w => w.length > room) ? String(name).slice(0, Math.max(1, room - 1)).trimEnd() + "…" : name;
+      });
+    });
+  }
   const levels = spec.categories.levels;
   const L = levels.length;
   const N = L ? levels[0].length : 0;
   // treemap: every level written on every row – Excel reads each row as one full hierarchy path
-  const starts = spec.kind === "treemap" ? levels.map(lv => lv.map(() => true)) : levelStarts(levels);
+  const starts = spec.kind === "treemap" ? levels.map(lv => lv.map(() => true)) : groups;
   spec.categories.names.forEach((name, l) => put(startRow, l, name || ""));
   spec.series.forEach((s, k) => put(startRow, L + k, s.name));
   // a date axis reads real dates
@@ -10413,7 +10508,8 @@ function serTx(ref, name) {
 }
 
 /** @param {string} ref @param {any[][]} levels @param {{ serials: number[] } | null} [dates] a date axis: the dates as serials */
-function catXml(ref, levels, dates = null) {
+/** groups: each level's group starts (writeChartData's, from the full names), else worked out from levels */
+function catXml(ref, levels, dates = null, groups = null) {
   if (dates) {
     return `<c:cat><c:numRef><c:f>${esc(ref)}</c:f><c:numCache><c:formatCode>yyyy\\-mm\\-dd</c:formatCode><c:ptCount val="${dates.serials.length}"/>` +
       dates.serials.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join("") + `</c:numCache></c:numRef></c:cat>`;
@@ -10421,7 +10517,7 @@ function catXml(ref, levels, dates = null) {
   if (levels.length <= 1) {
     return `<c:cat><c:strRef><c:f>${esc(ref)}</c:f><c:strCache>${strCache(levels[0] || [])}</c:strCache></c:strRef></c:cat>`;
   }
-  const starts = levelStarts(levels);
+  const starts = groups || levelStarts(levels);
   const n = levels[0].length;
   // innermost level first, as Excel writes it
   const lvls = levels.map((lv, l) => `<c:lvl>${lv.map((v, i) =>
@@ -10582,7 +10678,14 @@ function valueRange(spec, axisPlot) {
   if (follows) {
     const all = spec.series.flatMap(s => s.values || []).filter(v => num(v) !== null);
     if (fixed.min === undefined && spec.includeZero !== false && all.length && all.every(v => v >= 0)) fixed.min = 0;
-    return { fixed, unit: spec.valueMajorUnit || null };
+    // a short plot: Excel's own step crowds its few px with labels (0 10 20 … 50) – Tableau's, about every 55 px, of
+    // the values at export (a selection that grows them past it only adds ticks)
+    let unit = spec.valueMajorUnit || null;
+    if (!unit && axisPlot && spec.barDir !== "bar" && axisPlot.h < SHORT_PLOT_PX && all.length && !spec.stacked && !spec.valueAxisHidden) {
+      const lo = Math.min(0, ...all), hi = Math.max(0, ...all);
+      unit = niceUnit(hi - lo, Math.max(2, Math.round(axisPlot.h / 55)));
+    }
+    return { fixed, unit };
   }
   const vals = [], stacks = new Map();
   spec.series.filter(s => (!s.secondary || spec.secondarySync) && s.values).forEach(s => {
@@ -10658,12 +10761,12 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
       `<c:spPr>${solid(c, opacity)}<a:ln><a:noFill/></a:ln></c:spPr></c:dPt>` : "").join("");
     const pos = spec.labelPos || (spec.stacked ? null : "outEnd");
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity)}<a:ln><a:noFill/></a:ln></c:spPr><c:invertIfNegative val="0"/>` +
-      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${dpts}${dLbls(spec, s, pos)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "line" && s.refLine) {         // reference line: flat, no markers; label above the 2nd point, as Tableau's
     const at = Math.min(1, Math.max(0, (s.values || []).length - 1));
     return `<c:ser>${head}<c:spPr>${refLineLn(s.refLine)}</c:spPr><c:marker><c:symbol val="none"/></c:marker>` +
-      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
+      `${refLineLabel(spec, s.refLine, "t", "showVal", at)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}<c:smooth val="0"/></c:ser>`;
   }
   if (type === "line") {
     const lineSp = s.line === false ? `<a:ln w="28575"><a:noFill/></a:ln>`
@@ -10672,17 +10775,17 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
     const size = s.markerSize || 7;
     const dpts = s.marker ? pc.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(symbol, c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("") : "";
     return `<c:ser>${head}<c:spPr>${lineSp}</c:spPr>${markerXml(symbol, s.color, size)}${dpts}` +
-      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
+      `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "area") {
     return `<c:ser>${head}<c:spPr>${solid(s.color, opacity !== null || s.alpha !== undefined ? opacity : spec.stacked ? null : 75000)}<a:ln><a:noFill/></a:ln></c:spPr>` +
-      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}</c:ser>`;
+      `${dLbls(spec, s, null)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}</c:ser>`;
   }
   if (type === "pie") {
     const dpts = pc.map((c, i) => `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/>` +
       `<c:spPr>${solid(c || s.color)}${line("FFFFFF", 12700)}</c:spPr></c:dPt>`).join("");
     return `<c:ser>${head}${dpts}${dLbls(spec, s, spec.kind === "pie" ? "bestFit" : null)}` +
-      `${catXml(refs.cat, levels, spec.dateAxis)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
+      `${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "bubble") {
     // packed bubbles: opaque with a white outline like Tableau; map marks slightly see-through
@@ -11030,6 +11133,10 @@ function plotAreaXml(spec, refs, plot = null, axisPlot = null) {
 
 /* small multiples: room round Tableau's pane grid for the headers and axes (px) */
 const GRID_TOP = 18, GRID_BOTTOM = 22, GRID_PAD = 1, GRID_OVERLAP = 14, GRID_OVERLAP_V = 10, GRID_AXIS = 34;
+/* a chart this short (px) with no value axis is a sparkline: its plot is laid out by hand (chartXml) */
+const SPARKLINE_MAX_PX = 110;
+/* a value axis this short (px) gets Tableau's tick spacing even when the chart follows the slicers (valueRange) */
+const SHORT_PLOT_PX = 150;
 
 /** the grid's left margin (px): the row headers (turned: one line high; else as wide as the longest, at most 120 px)
  * and the value axis labels unless the workbook hides them @param {any} g spec.grid @param {ChartSpec} spec */
@@ -11078,7 +11185,9 @@ function chartXml(spec, refs, size) {
   const gi = g && gridInset(g, spec);
   const axisPlot = !size || !size.widthPx ? null
     : gi ? { w: size.widthPx - gi.l - gi.r, h: (size.heightPx || 300) - gi.t - gi.b }
-    : { w: size.widthPx * 0.85, h: (size.heightPx || 300) * 0.72 };
+    : { w: size.widthPx * 0.85,
+        // each extra level of a multi-level category axis takes a row of labels below the plot
+        h: (size.heightPx || 300) * 0.72 - Math.max(0, ((spec.categories && spec.categories.levels.length) || 1) - 1) * (spec.font.size || 9) * 4 / 3 * 1.6 };
   const layout = frame
     ? `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
       `<c:x val="${frame.x}"/><c:y val="${frame.y}"/><c:w val="${frame.w}"/><c:h val="${frame.h}"/></c:manualLayout></c:layout>`
@@ -11103,6 +11212,16 @@ function chartXml(spec, refs, size) {
       `<c:overlay val="1"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr></c:title>`;
     plotLayout = `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
       `<c:x val="${box.x}"/><c:y val="${box.y}"/><c:w val="${box.w}"/><c:h val="${box.h}"/></c:manualLayout></c:layout>`;
+  }
+  // a sparkline (a short chart, no value axis, no legend – a KPI tile's trend): the plot fills the chart above its
+  // category labels, as in Tableau; Excel's own layout keeps a margin that leaves it a sliver
+  const H0 = size && size.heightPx;
+  if (!g && !center && !frame && H0 && H0 <= SPARKLINE_MAX_PX && spec.valueAxisHidden && !spec.legend && !spec.title &&
+      /^(line|area|bar|combo)$/.test(spec.kind)) {
+    const W = (size && size.widthPx) || 200, f = v => Math.max(0, Math.min(1, v)).toFixed(4);
+    const labels = spec.categoryAxisHidden ? 0 : (spec.font.size || 9) * 4 / 3 * 1.3 + 4 + (spec.categoryTitle ? (spec.font.size || 9) * 4 / 3 * 1.3 : 0);
+    plotLayout = `<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>` +
+      `<c:x val="${f(4 / W)}"/><c:y val="${f(2 / H0)}"/><c:w val="${f((W - 8) / W)}"/><c:h val="${f((H0 - 2 - labels) / H0)}"/></c:manualLayout></c:layout>`;
   }
   if (g) {
     // every pane's plot area at the same place inside its chart, so the grid lines up like Tableau's panes
@@ -11919,17 +12038,45 @@ async function readSheet(ws, wrap, plain, hidden = false, domains = new Map()) {
   return snapshotSheet(ws.name, s);
 }
 
-/** Worksheets hidden on a dashboard by dynamic zone visibility (isVisible === false). */
-function hiddenWorksheetNames(objects) {
-  return new Set((objects || []).filter(o => o && o.type === "worksheet" && o.isVisible === false).map(o => o.name));
+/* px between the dashboard and the views its buttons switch to, drawn below it (room for their header) */
+const ALTERNATE_GAP_PX = 60;
+
+/**
+ * The views a dashboard's buttons switch between (dynamic zone visibility on a parameter: Gender / Race, Department /
+ * Job Role): Tableau shows one at a time, Excel cannot switch – so the hidden ones are drawn too, moved below the
+ * dashboard at their own place across, as the dashboard would look with the other choice. Returns the dashboard with
+ * those objects shown and moved (its methods kept), the moved zone ids, and the px where they begin.
+ * @param {any} dashboard @param {FormatModel | null} model
+ */
+function withAlternateViews(dashboard, model) {
+  const dash = model && model.dashboards && model.dashboards[dashboard.name];
+  const toggles = (dash && dash.toggles) || {};
+  const objects = dashboard.objects || [];
+  const moved = objects.filter(o => o && o.position && o.size && o.isVisible === false && toggles[String(o.id)]);
+  if (!moved.length) return { dashboard, alternates: new Set(), top: 0 };
+  const shown = objects.filter(o => o && o.position && o.size && o.isVisible !== false);
+  const top = Math.max(0, ...shown.map(o => o.position.y + o.size.height)) + ALTERNATE_GAP_PX;
+  const dy = top - Math.min(...moved.map(o => o.position.y));
+  const out = objects.map(o => (moved.includes(o) ? { ...plainObject(o), isVisible: true, position: { x: o.position.x, y: o.position.y + dy } } : o));
+  console.log(`[Views] ${dashboard.name}: ${moved.length} object(s) a button shows instead – drawn below the dashboard`);
+  return { dashboard: Object.create(dashboard, { objects: { value: out, enumerable: true } }), alternates: new Set(moved.map(o => String(o.id))), top };
+}
+
+/** Worksheets hidden on a dashboard by dynamic zone visibility (isVisible === false) – except the views a parameter's
+ * buttons switch to (the workbook's toggles): the export draws those too (withAlternateViews). */
+function hiddenWorksheetNames(objects, dashName) {
+  const model = getFormatModel();
+  const dash = model && model.dashboards && dashName ? model.dashboards[dashName] : null;
+  const toggled = dash && dash.toggles ? dash.toggles : {};
+  return new Set((objects || []).filter(o => o && o.type === "worksheet" && o.isVisible === false && !toggled[String(o.id)]).map(o => o.name));
 }
 
 /**
  * readSheet for every worksheet; results in the worksheets' order. A hidden (embedded) viz: one worksheet at a
  * time (see readSheet). The live dashboard: SHEET_READ_CONCURRENCY at a time, like fetchAllSheetsData.
  */
-async function readSheets(worksheets, wrap, plain, objects) {
-  const hidden = hiddenWorksheetNames(objects);
+async function readSheets(worksheets, wrap, plain, objects, dashName) {
+  const hidden = hiddenWorksheetNames(objects, dashName);
   /** @type {Map<string, Promise<number>>} each filtered field's value count, asked once for the dashboard */
   const domains = new Map();
   const list = [...(worksheets || [])];
@@ -11951,7 +12098,7 @@ async function readEmbeddedDashboard(viz) {
   const sheet = viz.workbook.activeSheet;
   if (!sheet || sheet.sheetType !== "dashboard") throw new Error("opened view is not a dashboard");
   const pass = p => p;
-  const sheets = await readSheets(sheet.worksheets, pass, true, sheet.objects);
+  const sheets = await readSheets(sheet.worksheets, pass, true, sheet.objects, sheet.name);
   let params = [];
   try {
     const wb = viz.workbook;
@@ -12017,7 +12164,8 @@ function withTimeout(promise, ms, what) {
  */
 async function snapshotLiveDashboard(current) {
   const bounded = (p, what) => withTimeout(p, LIVE_READ_TIMEOUT_MS, what);
-  const sheets = await readSheets(current.sheets, bounded, false, current.dashboard && current.dashboard.objects);
+  const sheets = await readSheets(current.sheets, bounded, false, current.dashboard && current.dashboard.objects,
+                                 current.dashboard && current.dashboard.name);
   let params = [];
   try {
     const d = current.dashboard;
@@ -12229,12 +12377,13 @@ const SLICER_ALL = "(All)";
 /**
  * A calculated filter that keeps the dates between two date parameters – Tableau's usual "Start Date / End Date"
  * pattern: [Order Date] >= [Parameters].[Start] AND [Order Date] <= [Parameters].[End] (also inside IF … THEN TRUE
- * ELSE FALSE END). Returns the date field, the parameters and whether each bound is strict; null for anything else.
+ * [ELSE FALSE] END – without ELSE the rows outside are Null, which the filter's True leaves out as well). Returns the
+ * date field, the parameters and whether each bound is strict; null for anything else.
  * @param {string} formula
  */
 function slicerParamRange(formula) {
   let f = String(formula || "").replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ").trim();
-  const wrapped = f.match(/^IF (.+?) THEN TRUE ELSE FALSE END$/i);
+  const wrapped = f.match(/^IF (.+?) THEN TRUE(?: ELSE FALSE)? END$/i);
   if (wrapped) f = wrapped[1];
   const cmp = "\\(?\\s*\\[([^\\]]+)\\]\\s*(>=|>|<=|<)\\s*\\[Parameters\\]\\.\\[([^\\]]+)\\]\\s*\\)?";
   const m = f.match(new RegExp(`^\\(?\\s*${cmp}\\s+AND\\s+${cmp}\\s*\\)?$`, "i"));
@@ -12310,8 +12459,22 @@ async function slicerDataSourceOf(ws, fieldName) {
   return sources.find(has) || sources[0] || null;
 }
 
+/** a logical table's column names (one row read) – which of a data source's related tables holds a field
+ * @param {any} ds @param {string} id */
+async function slicerTableColumns(ds, id) {
+  let t;
+  if (typeof ds.getLogicalTableDataReaderAsync === "function") {
+    const reader = await ds.getLogicalTableDataReaderAsync(id, 1, { ignoreAliases: false });
+    try { t = await reader.getPageAsync(0); } finally { await reader.releaseAsync(); }
+  } else t = await ds.getLogicalTableDataAsync(id, { ignoreAliases: false, maxRows: 1 });
+  return ((t && t.columns) || []).map(c => tfNorm(c.fieldName));
+}
+
 /**
- * The rows of the data source a worksheet draws the field from: one logical table, at most FORMAT_CONFIG.slicerMaxRows rows.
+ * The rows of the data source a worksheet draws the field from: one logical table – of related tables (Sheet1 +
+ * Vacency), the one that holds the field – at most FORMAT_CONFIG.slicerMaxRows rows. Another table's fields are not
+ * in these rows: their cards stay cards, and a visual that needs them keeps fixed values (the check against Tableau's
+ * numbers decides).
  * @param {any} ws a Tableau worksheet @param {string} fieldName @returns {Promise<SlicerSource>}
  * @typedef {{ id: string, name: string, columns: { name: string, dataType: string }[], rows: DataValue[][] }} SlicerSource
  */
@@ -12320,18 +12483,29 @@ async function readSlicerSource(ws, fieldName) {
   if (!ds) throw new Error("Tableau does not give this worksheet's data source here");
   if (typeof ds.getLogicalTablesAsync !== "function") throw new Error("the worksheet's data source cannot be read");
   const tables = await ds.getLogicalTablesAsync();
-  if (tables.length !== 1) throw new Error(`"${ds.name}" relates ${tables.length} tables – slicers need a data source of one table`);
+  if (!tables.length) throw new Error(`"${ds.name}" has no tables`);
+  let tableId = tables[0].id;
+  if (tables.length > 1) {
+    const name = tfNorm(fieldName);
+    const cols = [];
+    for (const t of tables) cols.push(await slicerTableColumns(ds, t.id));
+    let k = cols.findIndex(c => c.includes(name));
+    // a calculated field is in no table: the table with the most columns – the facts the related tables describe
+    if (k < 0) k = cols.reduce((best, c, i) => (c.length > cols[best].length ? i : best), 0);
+    tableId = tables[k].id;
+    console.log(`[Slicers] ${ds.name}: ${tables.length} related tables – "${tables[k].caption || tableId}" for "${fieldName}"`);
+  }
   const max = FORMAT_CONFIG.slicerMaxRows;
   const tooMany = n => new Error(`"${ds.name}" has ${n} rows, more than FORMAT_CONFIG.slicerMaxRows`);
   let table;
   if (typeof ds.getLogicalTableDataReaderAsync === "function") {
-    const reader = await ds.getLogicalTableDataReaderAsync(tables[0].id, 10000, { ignoreAliases: false });
+    const reader = await ds.getLogicalTableDataReaderAsync(tableId, 10000, { ignoreAliases: false });
     try {
       if (reader.totalRowCount > max) throw tooMany(reader.totalRowCount);
       table = await reader.getAllPagesAsync(max);
     } finally { await reader.releaseAsync(); }
   } else if (typeof ds.getLogicalTableDataAsync === "function") {
-    table = await ds.getLogicalTableDataAsync(tables[0].id, { ignoreAliases: false, maxRows: max + 1 });
+    table = await ds.getLogicalTableDataAsync(tableId, { ignoreAliases: false, maxRows: max + 1 });
     if (table.data.length > max) throw tooMany(`over ${max}`);
   } else {
     throw new Error("this Tableau version cannot read a data source's rows");
@@ -12996,9 +13170,11 @@ function createSlicerModel() {
         selected = new Set(f.isExcludeMode ? items.filter(v => !applied.includes(v)) : applied);
         if (selected.size === items.length) selected = null;
       }
-      // a card that picks one value (and has one, or all, picked) → a dropdown cell; else a slicer
+      // a card that picks one value – or a dropdown of several (checkdropdown) with all or one picked, when
+      // FORMAT_CONFIG.dropdownCards – → a dropdown cell; else a slicer (a dropdown cell holds one value)
       const current = selected ? [...selected][0] : null;
-      const single = /^(dropdown|radiolist|slider)$/i.test(card.mode || "") && (!selected || selected.size === 1) && current !== "\u0000";
+      const oneValue = /^(dropdown|radiolist|slider)$/i.test(card.mode || "") || (FORMAT_CONFIG.dropdownCards && /^checkdropdown$/i.test(card.mode || ""));
+      const single = oneValue && (!selected || selected.size === 1) && current !== "\u0000";
       /** @type {any} */
       const field = single
         ? { kind: "list", col, deriv, isDate, header: "", values, items, selected, tableCol: -1, current, control: null,
@@ -13091,7 +13267,8 @@ function createSlicerModel() {
         const c = vm.cols[ci];
         if (c.pivoted || generated(c)) continue;
         const deriv = String((c.ref && c.ref.deriv) || "none").toLowerCase();
-        if (!c.isHeader && (!c.ref || SLICER_AGGS[deriv] || deriv === "usr")) continue;
+        // a value: an aggregate, a calculation, or a percent of total of one (pcto:cnt:Gender – a measure, not a dimension)
+        if (!c.isHeader && (!c.ref || SLICER_AGGS[deriv] || deriv === "usr" || /^pcto/.test(deriv))) continue;
         const h = headOf(c.ref, c.label || c.name);
         if (typeof h === "string") {
           if (!c.ref || slicerColumnOf(src, model, c.ref) < 0) { dropped.push({ ci, reason: h }); continue; }
@@ -13160,8 +13337,23 @@ function createSlicerModel() {
       const allRows = [...rowsOf.values()].flat();             // every mark's (a percent of total's whole)
 
       // each measure: translated, then checked mark by mark against Tableau's value
-      /** @type {Map<number, { expr: SlicerExpr } | { reason: string }>} */
+      /** share: a percent of total within each stack (100 % stacked bars): the base measure's formula, which a 100 %
+       * stacked Excel chart turns into the same shares – never a table cell or KPI value
+       * @type {Map<number, { expr: SlicerExpr } | { reason: string, share?: SlicerExpr }>} */
       const measures = new Map();
+      const near = (v, t) => v !== null && Math.abs(v - t) <= 1e-6 * Math.max(1, Math.abs(t));
+      /** a percent of total Tableau computes within a partition (each month's bar, all the races in it): the heads
+       * but one (the stacked dimension) – the base measure of each mark over its partition's sum gives every value */
+      const shareWithin = (base, ci) => {
+        const vals = vm.rows.map(r => ({ r, t: tfDvNum(r[ci]), b: slicerEval(base, rowsOf.get(idOf(r, ci)) || [], src, allRows) }));
+        if (vals.some(x => x.t !== null && x.b === null)) return false;
+        return heads.length > 1 && heads.some((_, skip) => {
+          const keyOf = r => heads.filter((h, j) => j !== skip).map(h => tfDvText(r[h.ci])).join("\u0001");
+          const sums = new Map();
+          vals.forEach(x => { if (x.b !== null) sums.set(keyOf(x.r), (sums.get(keyOf(x.r)) || 0) + x.b); });
+          return vals.every(x => x.t === null || near(sums.get(keyOf(x.r)) ? x.b / sums.get(keyOf(x.r)) : 0, x.t));
+        });
+      };
       valueCols.forEach(ci => {
         const c = vm.cols[ci], label = c.label || c.name;
         const expr = slicerMeasureExpr(src, model, c.ref);
@@ -13170,14 +13362,16 @@ function createSlicerModel() {
           const t = tfDvNum(r[ci]);
           if (t === null) continue;
           const v = slicerEval(expr, rowsOf.get(idOf(r, ci)) || [], src, allRows);
-          if (v === null || Math.abs(v - t) > 1e-6 * Math.max(1, Math.abs(t))) {
-            measures.set(ci, { reason: `${label}: the data source's rows give ${v === null ? "no value" : +v.toPrecision(6)} where Tableau shows ${tfDvText(r[ci])}` });
+          if (!near(v, t)) {
+            const reason = `${label}: the data source's rows give ${v === null ? "no value" : +v.toPrecision(6)} where Tableau shows ${tfDvText(r[ci])}`;
+            const base = expr.op === "pct" ? /** @type {SlicerExpr} */ (expr.a) : null;
+            measures.set(ci, base && shareWithin(base, ci) ? { reason: `${label}: a percent of total within each stack (it follows only as a 100 % stacked chart)`, share: base } : { reason });
             return;
           }
         }
         measures.set(ci, { expr });
       });
-      const ok = [...measures.values()].filter(m => "expr" in m).length;
+      const ok = [...measures.values()].filter(m => "expr" in m || m.share).length;
       if (!ok) return [...measures.values()].map(m => /** @type {any} */ (m).reason)[0] || "no measure";
       locked = true;
 
@@ -13194,8 +13388,9 @@ function createSlicerModel() {
        * The formula of a value made of these marks' measure ci; null when it cannot follow the slicers.
        * "chart": a mark the slicers leave empty is #N/A (no point, no bar); "cell": an empty cell.
        */
-      const formula = (rows, ci, mode) => {
+      const formula = (rows, ci, mode, shares) => {
         const m = measures.get(ci);
+        if (m && !("expr" in m) && shares && m.share) return exprFormula(m.share, rows, ci, mode);
         if (!m || !("expr" in m)) return null;
         return exprFormula(m.expr, rows, ci, mode);
       };
@@ -13232,7 +13427,8 @@ function createSlicerModel() {
         }
         return extraExprs.get(ref.inner);
       };
-      const reasons = [...measures.entries()].filter(([ci, m]) => !("expr" in m) && vm.order.includes(ci)).map(([, m]) => /** @type {any} */ (m).reason);
+      // (a share counts as followed: where it cannot be – not a 100 % stacked chart – the report's "x of y values" says so)
+      const reasons = [...measures.entries()].filter(([ci, m]) => !("expr" in m) && !m.share && vm.order.includes(ci)).map(([, m]) => /** @type {any} */ (m).reason);
       console.log(`[Slicers] ${sheetName}: follows the slicers (${ids.size} marks, ${ok} measure${ok === 1 ? "" : "s"})` +
                   (reasons.length ? ` – fixed: ${reasons.join("; ")}` : ""));
       const binding = {
@@ -13255,10 +13451,11 @@ function createSlicerModel() {
           const out = groups.map(rows => exprFormula(expr, rows, ci, mode));
           return out.every(f => f) ? out : null;
         },
-        /** a chart value whose array knows its marks (values.src: tvSum) → its formula */
-        valueFormula(values, i) {
+        /** a chart value whose array knows its marks (values.src: tvSum) → its formula. shares: a 100 % stacked chart
+         * without value labels – a percent of total within each stack may be its base measure (Excel draws the shares) */
+        valueFormula(values, i, shares) {
           const s = values && values.src;
-          const f = s ? formula(s.rows[i], s.ci, "chart") : null;
+          const f = s ? formula(s.rows[i], s.ci, "chart", shares) : null;
           if (f) binding.written++; else binding.fixed++;
           return f;
         }
@@ -13785,9 +13982,12 @@ function wantsAllDashboards() {
  * (finalizeCharts runs after workbook.xlsx.writeBuffer(), with the sheet's final column widths / row heights).
  * ========================================================================= */
 async function writeDashboardSheet(workbook, sheetName, target, ctx) {
-    const dashboard = target.dashboard;
     const sheets = target.sheets;
     const { titleMap, fmtModel, chartData } = ctx;
+    // the views its buttons switch to are drawn below it (their objects shown and moved there)
+    const { dashboard, alternates } = withAlternateViews(target.dashboard, fmtModel);
+    /** a zone hidden on the dashboard – not one of those views */
+    const zoneHidden = z => !!z.hidden && !alternates.has(String(z.id));
     const filterValuesMap = await extractFilterValuesPerField(sheets);
     console.log(`📊 [${dashboard.name}] Filter values per field:`, filterValuesMap);
     const workbookWarning = fmtModel && isFormatModelStale(fmtModel)
@@ -13834,7 +14034,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       const sheetZone = dashM && dashM.zones.find(z => z.type === "worksheet" && z.name === sheetName && z.w && z.h);
       const api = (dashboard.objects || []).find(o => o.type === "worksheet" && o.name === sheetName && o.size);
       if (!sheetZone || !api) return [];
-      const zones = dashM.zones.filter(z => z.type === "color" && z.name === sheetName && !z.hidden);
+      const zones = dashM.zones.filter(z => z.type === "color" && z.name === sheetName && !zoneHidden(z));
       const sx = api.size.width / sheetZone.w, sy = api.size.height / sheetZone.h;
       return [pie, pie.inner].filter(s => s && s.legend).map((s, i) => {
         const z = zones.find(z => s.colorRef && z.param && tfSameField(tfParseFieldRef(z.param), s.colorRef)) || (i === 0 && zones.length === 1 ? zones[0] : null);
@@ -13965,7 +14165,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             // Tableau draws legends as separate dashboard cards, never inside the view: the chart keeps a
             // legend only when the dashboard shows a colour / size / shape legend for this sheet
             const dashZones = fmtModel && fmtModel.dashboards && fmtModel.dashboards[dashboard.name] ? fmtModel.dashboards[dashboard.name].zones : null;
-            if (dashZones && !dashZones.some(z => /^(color|size|shape)$/.test(z.type) && z.name === sheet.name && !z.hidden)) {
+            if (dashZones && !dashZones.some(z => /^(color|size|shape)$/.test(z.type) && z.name === sheet.name && !zoneHidden(z))) {
               visualModel.chartSpecs.forEach(s => { s.legend = false; });
             }
           } catch (err) {
@@ -14059,17 +14259,27 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       const controls = (dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "parameter" && o.isVisible !== false);
       const used = new Set();
       const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      // the workbook's control zones: which parameter each shows ([Parameters].[Parameter 3]) and its custom title
+      // ("Current Start Date") – the dashboard object may carry that title instead of the parameter's name
+      const ctrlZones = new Map(((fmtModel && fmtModel.dashboards[dashboard.name] || { zones: [] }).zones)
+        .filter(z => z.type === "paramctrl" && z.param).map(z => [String(z.id), z]));
+      const paramIdOf = p => norm(p.id || "") || norm(`[Parameters].[${p.name}]`);
       params.forEach(param => {
         const raw = param.currentValue ? (param.currentValue.formattedValue ?? String(param.currentValue.value)) : "";
         const value = String(raw).replace(/\s+12:00:00\s*AM$|\s+00:00:00$/i, "");   // dates: no midnight time
         reportParams.push({ name: param.name, value });
-        let control = controls.find(o => !used.has(o) && norm(o.name) === norm(param.name)) ||
-                      controls.find(o => !used.has(o) && norm(o.name).includes(norm(param.name)));
+        const info = fmtModel && Object.values(fmtModel.fields).find(f => f.param && norm(f.caption || f.name) === norm(param.name));
+        const ids = [paramIdOf(param), info && norm(`[Parameters].[${info.name}]`)].filter(Boolean);
+        const control = controls.find(o => !used.has(o) && ctrlZones.has(String(o.id)) && ids.includes(norm(ctrlZones.get(String(o.id)).param))) ||
+                        controls.find(o => !used.has(o) && !ctrlZones.has(String(o.id)) && norm(o.name) === norm(param.name)) ||
+                        controls.find(o => !used.has(o) && !ctrlZones.has(String(o.id)) && norm(o.name).includes(norm(param.name)));
         if (!control) return;                                      // parameter not shown on this dashboard
         used.add(control);
+        const zone = ctrlZones.get(String(control.id));
+        const title = (zone && zone.customTitle && tfZoneText(zone)) || param.name;
         filterValueItems.push({
-          type: "filterValue", isParameter: true, name: param.name, visualName: param.name,
-          filterName: param.name, values: [value], layout: layoutMap.get(control.name), rowCount: 2, param
+          type: "filterValue", isParameter: true, name: param.name, visualName: title,
+          filterName: title, values: [value], layout: layoutMap.get(control.name), rowCount: 2, param
         });
       });
       if (params.length) console.log(`[Parameters] ${used.size} of ${params.length} parameters have a control on the dashboard`);
@@ -14137,14 +14347,26 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             const info = tfFieldInfo(fmtModel, ref);
             const spec = info && slicerParamRange(info.formulaFull || info.formula);
             const lo = spec && paramCard(spec.lo), hi = spec && paramCard(spec.hi);
-            if (!spec || !lo || !hi) continue;
+            if (!spec || (!lo && !hi)) continue;
+            // a bound whose parameter has no control on the dashboard stays at the workbook's value of it (Current
+            // date End 1 beside a Current date End control): only the other one is a date cell
+            const fixedBound = name => {
+              const p = fmtModel.fields["Parameters|" + String(name).toLowerCase()];
+              const m = p && String(p.value || "").match(/^#(\d{4}-\d\d-\d\d)(?:[ T][\d:]+)?#$/);
+              return m ? { value: m[1], formattedValue: m[1] } : null;
+            };
+            const loDv = lo ? lo.param.currentValue : fixedBound(spec.lo), hiDv = hi ? hi.param.currentValue : fixedBound(spec.hi);
+            if (!loDv || !hiDv) continue;
             const ws = sheets.find(s => s.name === item.name);
-            const field = await slicers.adoptParamRange({ calc: ref, date: spec.date, lo: lo.param.currentValue, hi: hi.param.currentValue,
+            const field = await slicers.adoptParamRange({ calc: ref, date: spec.date, lo: loDv, hi: hiDv,
                                                           loStrict: spec.loStrict, hiStrict: spec.hiStrict }, ws, fmtModel);
-            if (typeof field === "string") { console.log(`[Slicers] ${info.caption || ref.name} (dates between ${lo.param.name} and ${hi.param.name}) stays fixed: ${field}`); continue; }
-            (lo.paramFields = lo.paramFields || []).push({ field, end: "from" });
-            (hi.paramFields = hi.paramFields || []).push({ field, end: "to" });
-            lo.rowCount = hi.rowCount = 3;                       // title, Year / Month / Day dropdowns, the date
+            const between = `dates between ${lo ? lo.param.name : spec.lo} and ${hi ? hi.param.name : spec.hi}`;
+            if (typeof field === "string") { console.log(`[Slicers] ${info.caption || ref.name} (${between}) stays fixed: ${field}`); continue; }
+            [[lo, "from"], [hi, "to"]].forEach(([card, end]) => {
+              if (!card) return;
+              (card.paramFields = card.paramFields || []).push({ field, end });
+              card.rowCount = 3;                                 // title, Year / Month / Day dropdowns, the date
+            });
           }
         }
       }
@@ -14205,7 +14427,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     const textItems = [];
     (dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "text" && o.isVisible !== false).forEach(o => {
       const zone = dashZones.find(z => z.type === "text" && String(z.id) === String(o.id));
-      if (!zone || zone.hidden || headerZoneIds.has(zone.id)) return;
+      if (!zone || zoneHidden(zone) || headerZoneIds.has(zone.id)) return;
       const layout = layoutMap.get(`text:${o.id}`);
       const card = buildTextCard(zone, layout, fmtModel);
       if (!card) return;
@@ -14226,7 +14448,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     imageObjects.forEach(o => {
       const cls = imageKinds.get(String(o.id));
       const zone = dashZones.find(z => z.type === "bitmap" && String(z.id) === String(o.id));
-      if (!zone || !zone.param || zone.hidden) return;
+      if (!zone || !zone.param || zoneHidden(zone)) return;
       if (cls.kind === "backdrop" || cls.kind === "tiny") { console.log(`[Images] ${zone.param}: ${cls.kind === "tiny" ? "divider" : "background"} – not exported`); return; }
       const file = workbookImages[zone.param];
       if (!file) { console.warn(`[Images] ${zone.param} is not in the loaded workbook – load the .twbx to export it`); return; }
@@ -14392,6 +14614,15 @@ setTableVisibleRows(placedItems);
       ...item,
       gridRow: item.gridRow + currentRow
     }));
+    // the views the buttons switch to (withAlternateViews) start two rows under the dashboard's blocks: a row for
+    // their header (the layout closes up empty rows, so the gap between them is not kept)
+    const zoneOf = it => (it.layout && it.layout.id !== undefined ? String(it.layout.id) : "");
+    const altItems = adjustedItems.filter(it => alternates.has(zoneOf(it)));
+    const dashEnd = Math.max(0, ...adjustedItems.filter(it => !alternates.has(zoneOf(it))).map(it => it.gridRow + Math.max(1, it.allocatedRows || 1)));
+    if (altItems.length) {
+      const shift = dashEnd + 2 - Math.min(...altItems.map(it => it.gridRow));
+      if (shift > 0) altItems.forEach(it => { it.gridRow += shift; });
+    }
 
     // native charts: data goes to a hidden sheet now, chart parts are injected after writeBuffer()
     const chartJobs = [];
@@ -14460,7 +14691,10 @@ setTableVisibleRows(placedItems);
         const paneH = Math.floor(item.box.heightPx / specs.length);     // separate panes stack vertically
         specs.forEach((spec, k) => {
           if (item.vm.slicerBinding) {
-            spec.valueFormula = item.vm.slicerBinding.valueFormula;
+            const binding = item.vm.slicerBinding;
+            // a 100 % stacked chart without value labels: Excel draws each stack's shares itself from the base measure
+            const shares = !!spec.percent && !spec.series.some(s => s.labels || s.labelTexts);
+            spec.valueFormula = shares ? (values, i) => binding.valueFormula(values, i, true) : binding.valueFormula;
             // a waterfall's bars are computed from its steps (cells of its own), not taken from the marks
             if (/** @type {any} */ (spec).waterfall && bindWaterfall(spec, item.vm.slicerBinding)) {
               spec.valueFormula = undefined;
@@ -14470,6 +14704,7 @@ setTableVisibleRows(placedItems);
             if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
             if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
           }
+          spec.widthPx = item.box.widthPx;                 // writeChartData fits group names to it
           const refs = ExcelChartWriter.writeChartData(chartDataSheetOf(), spec, chartData.row);
           chartData.row = refs.nextRow;
           const offPx = k * paneH;
@@ -14572,6 +14807,41 @@ setTableVisibleRows(placedItems);
         writeRegularTable(worksheet, item.vm, item.gridRow, item.gridCol, tracker, allTablesInfo, colWidths, exactWidths, item.visibleRows,
                           item.fieldCols);
       }
+    }
+
+    // ── the views the buttons switch to (withAlternateViews), below the dashboard: a header over them that links back
+    //    up, and each button a link to the view it shows (Excel cannot switch them in place)
+    if (altItems.length) {
+      const link = (r, c) => `#${sheetRef(worksheet.name, `${getExcelColumnName(c)}${r + 1}`)}`;
+      const left = Math.min(...altItems.map(it => it.gridCol)), top = Math.min(...altItems.map(it => it.gridRow));
+      const head = worksheet.getCell(Math.max(dashEnd, top - 1) + 1, left + 1);     // the row left for it above them
+      if (head.value === null || head.value === undefined || head.value === "") {
+        head.value = { text: "Other views – in Tableau a button switches the view above to one of these   ↑ back to the dashboard", hyperlink: link(0, 0) };
+        head.font = { bold: true, size: 10, color: { argb: "FF595959" } };
+      }
+      const dashM = fmtModel && fmtModel.dashboards[dashboard.name];
+      const textOf = v => (v && typeof v === "object" ? (v.richText ? v.richText.map(t => t.text).join("") : v.text || "") : String(v ?? "")).trim();
+      ((fmtModel && fmtModel.paramActions) || []).filter(a => !a.dashboard || a.dashboard === dashboard.name).forEach(a => {
+        const button = adjustedItems.find(it => it.name === a.worksheet);
+        const ref = a.field ? tfParseFieldRef(a.field) : null;
+        const info = ref ? tfFieldInfo(fmtModel, ref) : null;
+        const lit = info && String(info.formula || "").trim().match(/^'((?:[^']|'')*)'$|^"((?:[^"]|"")*)"$/);
+        if (!button || !lit || !dashM) return;
+        const value = lit[1] !== undefined ? lit[1].replace(/''/g, "'") : lit[2].replace(/""/g, '"');
+        // the zones this button's value shows, and where they are now (above if Tableau shows them, else below)
+        const zones = new Set(Object.entries(dashM.toggles || {}).filter(([, t]) => t.param === a.param && t.value === value).map(([z]) => z));
+        const views = adjustedItems.filter(it => zones.has(zoneOf(it)) && it.type === "worksheet");
+        if (!views.length) return;
+        const r = Math.min(...views.map(it => it.gridRow)), c = Math.min(...views.map(it => it.gridCol));
+        for (let rr = button.gridRow; rr < button.gridRow + Math.max(1, button.allocatedRows); rr++) {
+          for (let cc = button.gridCol; cc < button.gridCol + Math.max(1, button.gridW); cc++) {
+            const cell = worksheet.getCell(rr + 1, cc + 1);
+            if (textOf(cell.value).toLowerCase() !== value.toLowerCase()) continue;
+            cell.value = { text: textOf(cell.value), hyperlink: link(r, c), tooltip: `Go to the ${views.map(v => v.visualName || v.name).join(", ")} view` };
+            return;
+          }
+        }
+      });
     }
 
     // ── how each visual was converted (NATIVE … TABLE_FALLBACK), and why: the report sheet, the panel status, and a
