@@ -2,7 +2,7 @@
 
 > Tableau dashboard extension that converts dashboards into editable, formatted Excel workbooks.
 
-[![Repository](https://img.shields.io/badge/GitHub-kumaranshuman--neenopal%2Ftableau--to--excel-181717?style=flat-square&logo=github)](https://github.com/kumaranshuman-neenopal/tableau-to-excel)
+[![Repository](https://img.shields.io/badge/GitHub-Repo-181717?style=flat-square&logo=github)](https://github.com/kumaranshuman-neenopal/tableau-to-excel)
 [![Runtime](https://img.shields.io/badge/Runtime-Tableau%20Desktop%20%7C%20Cloud-1C1C1C?style=flat-square&logo=tableau)](#run-it-in-tableau-desktop)
 [![CI](https://github.com/kumaranshuman-neenopal/tableau-to-excel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kumaranshuman-neenopal/tableau-to-excel/actions/workflows/ci.yml)
 
