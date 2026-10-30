@@ -795,7 +795,15 @@ function tfBuildColorScale(fmt, enc, values) {
   }
   // categorical
   const map = {};
-  if (def) for (const [k, c] of Object.entries(def.map)) fmt.bucketAliases(k).forEach(a => { map[tfNorm(a)] = c; });
+  if (def) {
+    // one palette can hold a measure under several aggregations (SUM and AVG of the same calculation, each its own
+    // colour): the entries of the measures this sheet shows (its Measure Names list) are applied last, so they win
+    const bare = k => tfNorm(String(k).replace(/^"|"$/g, "").replace(/\\(.)/g, "$1"));
+    const shown = new Set(((fmt.sheetModel || {}).measureFilter || []).map(bare));
+    const entries = Object.entries(def.map);
+    const mine = ([k]) => shown.has(bare(k));
+    [...entries.filter(e => !mine(e)), ...entries.filter(mine)].forEach(([k, c]) => fmt.bucketAliases(k).forEach(a => { map[tfNorm(a)] = c; }));
+  }
   const used = new Set(Object.values(map));
   const pool = TABLEAU_10.filter(c => !used.has(c));
   const auto = {};
@@ -1416,7 +1424,12 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
      * A layer underneath that the top layer covers is dropped (plain pie). The id-less "All" pane draws nothing.
      * null: not a pie (or 3+ layers). */
     pieLayers() {
-      const drawn = panes.length > 1 && panes.some(p => p.id) ? panes.filter(p => p.id) : panes;
+      // the drawn layers: on a dual axis the panes with their own axis (the "All" marks card, pane 1 in some
+      // workbooks, has an id but no axis); on map layers the panes with an id
+      const axisPanes = panes.filter(p => p.yAxisName || p.xAxisName);
+      // on map layers the "All" pane has an id too, but no field of its own
+      const layerPanes = panes.filter(p => p.id && (p.encodings || []).length);
+      const drawn = axisPanes.length >= 2 ? axisPanes : panes.length > 1 && layerPanes.length ? layerPanes : panes;
       const isPieP = p => /^pie$/i.test(p.markClass || "");
       if (drawn.length === 1) return isPieP(drawn[0]) ? { outer: drawn[0], hole: null, inner: null } : null;
       if (drawn.length !== 2) return null;
@@ -1432,6 +1445,9 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
         if (!drawn.every(isPieP)) return null;
         const size = p => parseFloat(markRule(p, "size")) || 1;
         const [bottom, top] = drawn;
+        // a gauge's hole drawn as a second pie: smaller, on top, Marks colour white – the hole with its text
+        const white = p => /^#?f{6}$/i.test(String(markRule(p, "mark-color") || "").trim());
+        if (size(top) < size(bottom) && white(top) && !white(bottom)) return { outer: bottom, hole: top, inner: null };
         return size(top) < size(bottom) ? { outer: bottom, hole: null, inner: top } : { outer: top, hole: null, inner: null };
       }
       if (!isPieP(drawn[oi]) || !/^(pie|circle)$/i.test(drawn[hi].markClass || "")) return null;
@@ -1583,8 +1599,10 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
     /* display names for Measure-Names buckets like "[ds].[sum:Sales:qk]" */
     bucketAliases(bucketKey) {
       if (!/^\[.*\]$/.test(bucketKey)) return [bucketKey];
-      const ref = tfParseFieldRef(bucketKey);
-      return ref ? [bucketKey, ...tfDisplayNames(model, ref)] : [bucketKey];
+      // Tableau escapes some characters in a member's field name ("[sum:gray>50\% (copy 2)_…]")
+      const plain = bucketKey.replace(/\\(.)/g, "$1");
+      const ref = tfParseFieldRef(plain);
+      return ref ? [bucketKey, ...(plain !== bucketKey ? [plain] : []), ...tfDisplayNames(model, ref)] : [bucketKey];
     }
   };
 }
@@ -4201,7 +4219,13 @@ function buildPieSpec(fmt, summary, opts = {}) {
   const rowHdr = hdr("rows"), colHdr = hdr("cols");
   const keyOf = (r, idx) => idx.map(i => tfDvText(r[i])).join(" | ");
   const hdrSet = new Set([...rowHdr, ...colHdr]);
-  const dimIdx = cols.map((c, i) => !c.numeric && !hdrSet.has(i) && !/^measure values$/i.test(c.name) ? i : -1).filter(i => i >= 0);
+  // a slice's name: its dimensions – not a field only another layer uses (a hole's "dummy" colour field)
+  const sheetPanes = ((fmt.sheetModel || {}).panes) || [];
+  const mineRefs = fmt.encodingRefs(/./);
+  const otherLayerOnly = ref => !mineRefs.some(r => tfSameField(r, ref)) &&
+    sheetPanes.some(p => (p.encodings || []).some(e => e.field && tfSameField(e.field, ref)));
+  const dimIdx = cols.map((c, i) => !c.numeric && !hdrSet.has(i) && !/^measure values$/i.test(c.name) &&
+                                    !(c.ref && !/^measure names$/i.test(c.name) && otherLayerOnly(c.ref)) ? i : -1).filter(i => i >= 0);
 
   const valueCaption = vi >= 0 ? fmt.captionFor(angleRef, cols[vi].name) : "Marks";
   const showLabels = fmt.markLabelsShown();
@@ -4257,7 +4281,8 @@ function buildHoleSpec(fmt, pie) {
   const ai = ax ? pie.columns.findIndex(c => c.ref && tfSameField(c.ref, ax)) : -1;
   // the hole's own row: one the slices don't use (on one shared axis measure every row has an axis value)
   const sliceRows = new Set(pie.points.map(p => p.row));
-  const axisRows = ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])) : [];
+  // map layers have no axis: every row is a candidate – the hole's own row is one no slice uses
+  const axisRows = ai >= 0 ? pie.data.filter(r => !tfIsNull(r[ai])) : ax ? [] : pie.data;
   const spare = axisRows.filter(r => !sliceRows.has(pie.data.indexOf(r)));
   const own = new Map((spare.length ? spare : axisRows).map(r => [pie.paneOf(r), r]));
   const valueOf = pts => ref => {
@@ -4354,6 +4379,14 @@ function buildPieModel(model, sheetName, summary, opts) {
   if (layers.hole) pie.hole = buildHoleSpec(scoped(layers.hole), pie);
   if (layers.inner) pie.inner = buildPieSpec(scoped(layers.inner), summary, opts);
   pie.gauge = !layers.inner && pieIsGauge(pie, (fmt.tableBackground() || "FFFFFFFF").slice(2));
+  // headers hidden in Tableau (Show Header off on every discrete field of a shelf): the pies get no title from them
+  const sm = fmt.sheetModel || {};
+  const hiddenRefs = ((((sm.style || {}).rules || {}).label) || []).filter(r => r.attr === "display" && r.value === "false")
+    .map(r => tfParseFieldRef(r.field)).filter(Boolean);
+  const allHidden = shelf => { const dims = (sm[shelf] || []).filter(r => r && r.type !== "qk");
+    return dims.length > 0 && dims.every(f => hiddenRefs.some(h => tfSameField(h, f))); };
+  pie.hideRowHeaders = allHidden("rows");
+  pie.hideColHeaders = allHidden("cols");
   const fit = fmt.fitMode(opts.dashboardName);                 // Entire View / Fit Width / Fit Height → the pane fills the zone
   if (/^(entire-view|fit-width)$/.test(fit || "")) pie.stretch.w = true;
   if (/^(entire-view|fit-height)$/.test(fit || "")) pie.stretch.h = true;
@@ -4550,7 +4583,22 @@ function buildPieCharts(pie, block, paneRefs, o) {
     // a gauge's slice in the background colour hides part of the dial: see-through (on any background); its label
     // and tooltip stay as Tableau shows them
     const bgU = String(o.bg || "").toUpperCase();
-    const shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
+    let shown = pts.map(p => pie.gauge && p.color && String(p.color).toUpperCase() === bgU ? { ...p, hidden: true } : p);
+    // a gauge's label that is the same on every slice (its name: "BNI / Kredit Konsumer / Limit : 80%") is
+    // shown once by Tableau, above the dial: kept on the visible slice nearest 12 o'clock, dropped on the others
+    if (pie.gauge) {
+      const textOf = p => (p.label ? JSON.stringify((p.label || []).map(l => (Array.isArray(l) ? l : [l]).map(x => (x && x.text !== undefined ? x.text : x)))) : "");
+      const labelled = shown.map((p, i) => i).filter(i => textOf(shown[i]));
+      if (labelled.length > 1 && labelled.every(i => textOf(shown[i]) === textOf(shown[labelled[0]]))) {
+        const total = shown.reduce((t, p) => t + Math.abs(p.value || 0), 0) || 1;
+        let a = 0;
+        const mid = shown.map(p => { const st = a; a += 360 * Math.abs(p.value || 0) / total; return (st + a) / 2; });
+        const top = i => Math.min(mid[i], 360 - mid[i]);
+        const pick = labelled.filter(i => !shown[i].hidden && Math.abs(shown[i].value || 0) > 0)
+                             .sort((x, y) => top(x) - top(y))[0];
+        if (pick !== undefined) shown = shown.map((p, i) => (i === pick || !p.label ? p : { ...p, label: null }));
+      }
+    }
     const texts = bound ? [] : [...labelsOf(shown, D / 2, pie.cullLabels), ...(innerPts.length ? labelsOf(innerPts, innerD / 2, pie.inner.cullLabels) : [])];
     // Excel's hole is see-through (it shows the chart background): a hole in another colour is a filled circle
     // under the labels. Bound to the slicers, a donut is a pie under such a circle: Excel puts a pie's labels outside
@@ -4570,7 +4618,7 @@ function buildPieCharts(pie, block, paneRefs, o) {
     const x = M + cj * pw, y = ri * ph;
     const spec = {
       seriesName: pie.valueCaption, categories: pts.map(p => p.category), values: pts.map(p => p.value), ref: refs.ref,
-      title: [rk, ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
+      title: [pie.hideRowHeaders ? null : rk, pie.hideColHeaders ? null : ck].filter(Boolean).join(" | ") || null, titleFont: pie.font, font: pie.font, bg: o.bg,
       plot: { x: (1 - D / pw) / 2, y: (1 - D / ph) / 2, w: D / pw, h: D / ph },
       holeSize: holeAsCircle ? null : holeD ? 100 * holeD / D : innerPts.length ? 100 * innerD / D : null,
       points: shown.map(p => ({ color: p.hidden ? null : p.color, selected: p.selected })), hasShapes: texts.length > 0, cellLabels
@@ -5404,10 +5452,15 @@ function buildGaugeCharts(gauge, block, refs, o) {
 
 /** a pie / donut gauge: one slice painted the background colour (Tableau's trick to hide the bottom half) */
 function pieIsGauge(pie, bg) {
-  const total = pie.points.reduce((s, p) => s + Math.abs(p.value || 0), 0);
   const bgU = String(bg || "FFFFFF").toUpperCase();
-  return total > 0 && pie.points.some(p => p.color && String(p.color).toUpperCase() === bgU &&
-                                         Math.abs(p.value) / total >= 0.2 && Math.abs(p.value) / total <= 0.6);
+  // each pie on its own: small multiples (one gauge per member) share the points list
+  const pies = new Map();
+  pie.points.forEach(p => { const k = `${p.rowKey}\u0001${p.colKey}`; if (!pies.has(k)) pies.set(k, []); pies.get(k).push(p); });
+  return [...pies.values()].some(pts => {
+    const total = pts.reduce((s, p) => s + Math.abs(p.value || 0), 0);
+    return total > 0 && pts.some(p => p.color && String(p.color).toUpperCase() === bgU &&
+                                      Math.abs(p.value) / total >= 0.2 && Math.abs(p.value) / total <= 0.6);
+  });
 }
 
 
@@ -7923,7 +7976,10 @@ function appendExportNotes(notes) {
  * ============================================================================= */
 
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
-const EXTENSION_VERSION = "2.0.0";
+const EXTENSION_VERSION = "2.0.2";
+/** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
+const EXTENSION_BUILD = "2026-10-30 multi-gauge";
+console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
 
@@ -8057,7 +8113,7 @@ function ensureLicenceBox() {
       </div>
       <div style="color:#6b7a73;margin-top:2px">Saved with this workbook, so viewers don't need it.</div>
     </div>
-    <div style="color:#9aa6a0;margin-top:2px">v${EXTENSION_VERSION}</div>`;
+    <div style="color:#9aa6a0;margin-top:2px">v${EXTENSION_VERSION} · ${EXTENSION_BUILD}</div>`;
   exportBtn.parentNode.insertBefore(box, exportBtn);
   return box;
 }
@@ -10280,7 +10336,8 @@ function writeConversionReport(workbook, report) {
   put(r, 1, "Tableau → Excel conversion report", { ...font, size: 14, bold: true }, { alignment: { wrapText: false } });
   ws.mergeCells(r, 1, r, 6);
   r++;
-  put(r, 1, `Dashboard: ${report.dashboard}` + (report.workbookFile ? `   ·   Workbook: ${report.workbookFile}` : "   ·   no workbook loaded"),
+  put(r, 1, `Dashboard: ${report.dashboard}` + (report.workbookFile ? `   ·   Workbook: ${report.workbookFile}` : "   ·   no workbook loaded") +
+           `   ·   Export to Excel v${EXTENSION_VERSION} (${EXTENSION_BUILD})`,
       font, { alignment: { wrapText: false } });
   ws.mergeCells(r, 1, r, 6);
   r++;
@@ -10365,7 +10422,8 @@ function writeConversionReports(workbook, reports) {
   const all = reports.flatMap(rep => rep.visuals);
   banner("Tableau → Excel conversion report", { ...font, size: 14, bold: true });
   r++;
-  banner(`${reports.length} dashboards` + (reports[0].workbookFile ? `   ·   Workbook: ${reports[0].workbookFile}` : "   ·   no workbook loaded"), font);
+  banner(`${reports.length} dashboards` + (reports[0].workbookFile ? `   ·   Workbook: ${reports[0].workbookFile}` : "   ·   no workbook loaded") +
+         `   ·   Export to Excel v${EXTENSION_VERSION} (${EXTENSION_BUILD})`, font);
   r++;
   banner(`${all.length} visual${all.length === 1 ? "" : "s"}: ` + (strategyCounts(all).map(([s, n]) => `${n} ${s}`).join("   ·   ") || "none"), bold);
 
