@@ -1,0 +1,10 @@
+{
+  "name": "tableau-to-excel",
+  "private": true,
+  "description": "Tableau dashboard extension that exports dashboards to native Excel – tests and build tools only (no dependencies)",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "stamp": "node tools/stamp.js",
+    "stamp:check": "node tools/stamp.js --check"
+  }
+}

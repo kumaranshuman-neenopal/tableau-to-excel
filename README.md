@@ -146,7 +146,12 @@ tableau-to-excel.js       the whole extension, one section per module:
                             main.js                    panel wiring
 js/                       Tableau Extensions API library, ExcelJS 4.4, JSZip 3.10
 Export.trex               extension manifest (points Tableau at the hosted index.html)
-.github/workflows/ci.yml  CI: syntax check of tableau-to-excel.js, page and manifest checks
+tests/                    node --test suites: engine (calculations, filter kinds), Visual Gallery export, real workbooks
+  lib/                      a mock of the Tableau API, exporters for any .twbx (made-up or packed data), report reader
+  fixtures/gallery.twb      the Visual Gallery test workbook (layout only, Tableau's sample data sources)
+  excel/                    Excel checks for Windows (recalculated formulas against the workbook's data)
+tools/stamp.js            the build stamp: date + hash of the code, and the script's ?v= in index.html
+.github/workflows/ci.yml  CI: syntax check, build stamp, tests, page and manifest checks
 ```
 
 ## Current scope and limitations
@@ -166,10 +171,33 @@ The project should be evaluated against representative dashboards containing the
 ## Development
 
 ```bash
-node --check tableau-to-excel.js
+npm test
 ```
 
-For regression testing, use representative Tableau workbooks and verify:
+runs every suite with Node's own test runner (no dependencies): the slicer engine (calculations translated to Excel,
+every filter kind), and the Visual Gallery dashboard exported end to end against a mock of the Tableau API – its
+sheets, build stamp, the visuals that follow the slicers, a package Excel opens without repairing. CI runs the same.
+
+The real-workbook suite needs the workbooks, which stay out of this public repository: point `TFX_WORKBOOKS` at the
+folder holding `Ecommerce_Dashboard.twbx` and `Untitled_17.twbx` (their packed CSV / Excel data is served as Tableau
+serves it). On Windows with Excel, `TFX_EXCEL=1` also recalculates the exported formulas in Excel and compares them
+with numbers computed from the workbooks' own data.
+
+```bash
+TFX_WORKBOOKS="$HOME/Downloads" TFX_EXCEL=1 npm test
+```
+
+Any dashboard can be exported without Tableau for a look: `node tests/lib/export-twbx.js <file.twbx> <dashboard | ALL> out.xlsx`
+(switches in its header: packed data, a preselected filter value …).
+
+**Build stamp.** Every export names the build that made it (Conversion Report, panel): `EXTENSION_BUILD` is the date
+and a hash of the code, and the same hash is the script's `?v=` in `index.html`, so browsers load each new build
+instead of a cached one. `node tools/stamp.js` writes both after a code change (`--version x.y.z` for a release also
+sets `EXTENSION_VERSION` and `Export.trex`); CI fails when they are stale. To stamp on every commit automatically:
+`git config core.hooksPath .githooks` with a `pre-commit` hook that runs `node tools/stamp.js` and stages
+`tableau-to-excel.js` and `index.html`.
+
+For regression testing beyond the suites, use representative Tableau workbooks and verify:
 
 1. dashboard dimensions and object ordering;
 2. extracted values and filters;
