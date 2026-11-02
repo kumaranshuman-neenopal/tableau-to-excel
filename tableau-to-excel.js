@@ -249,6 +249,9 @@ const FORMAT_CONFIG = {
   actionSlicers: true,            // Tableau's filter actions (click a mark → filter the other sheets): a slim slicer of the
                                   // field along the top of the source chart that filters the action's target sheets
   actionSlicerMaxItems: 100,      // a field with more values than this gets no action slicer
+  actionBandGroups: true,         // the action slicers' rows as row groups: [–] in the margin hides them (and the slicer)
+  pieFillZone: true,              // a single pie whose Size slider was never moved (Tableau draws it 80 px wide, whatever its
+                                  // zone): drawn to fill its zone, room left for the labels; a set size stays Tableau's
   filterStates: true,             // visuals the slicer formulas cannot rebuild: Tableau's own numbers for each value of each
                                   // dropdown, read at export by setting the filter in Tableau (one filter at a time in Excel)
   filterStatesMaxValues: 60,      // a filter card with more values than this is not read value by value
@@ -4020,6 +4023,7 @@ function groupedAnchorXml(chart, chartRid, ids, tipRids) {
  * cell is clipped to it. */
 const PIE_DIAMETER_PX = 80;
 const PIE_CELL_PX = 160;
+const PIE_FILL_SHARE = 0.6;                  // a pie filling its zone (pieFillZone): this share of the zone's shorter side
 const ZONE_MARGIN = 4;
 /** @param {number | null | undefined} sizeValue Size slider */
 const pieDiameterPx = sizeValue => sizeValue === null || sizeValue === undefined ? PIE_DIAMETER_PX : PIE_DIAMETER_PX * Math.max(0.01, sizeValue);
@@ -4649,10 +4653,13 @@ function buildPieCharts(pie, block, paneRefs, o) {
   // Tableau clips an oversized pie to its cell; Excel can't clip, so it fills the cell instead – and the hole /
   // inner ring shrink with it, so the ring keeps Tableau's proportions
   const full = pieDiameterPx(pie.markSize);
-  const D = Math.min(full, pw, ph), k = D / full;
+  const single = pie.rowKeys.length * pie.colKeys.length === 1;
+  // Size never set: Tableau's small default pie grows to its zone (the hole / inner ring with it, as below)
+  const fill = FORMAT_CONFIG.pieFillZone && single && (pie.markSize === null || pie.markSize === undefined)
+    ? Math.max(full, PIE_FILL_SHARE * Math.min(pw, ph)) : full;
+  const D = Math.min(fill, pw, ph), k = D / full;
   const holeD = pie.hole ? Math.min(pieDiameterPx(pie.hole.markSize) * k, D) : 0;
   const innerD = pie.inner ? Math.min(pieDiameterPx(pie.inner.markSize) * k, D) : 0;
-  const single = pie.rowKeys.length * pie.colKeys.length === 1;
   // links: a cell per point whose text the label shows (a gauge that empties with the slicers)
   const labelsOf = (pts, R, cull, links) => {
     const boxes = pieLabelLayout(pts, { cx: pw / 2, cy: ph / 2, R, w: pw, h: ph, cull, textScale });
@@ -8192,7 +8199,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-02 bb65d18f";
+const EXTENSION_BUILD = "2026-11-02 ef16705e";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -13227,7 +13234,8 @@ function actionSlicerSize(field, widthPx) {
   // even rows when they all show (7 values in rows of 4 + 3, not 6 + 1); more than that scroll, as many to a row as fit
   if (allRows <= ACTION_MAX_ROWS) columnCount = Math.ceil(n / allRows);
   const rows = Math.min(ACTION_MAX_ROWS, allRows);
-  return { columnCount, rows, heightPx: rows * (SLICER_ITEM_PX + ACTION_ITEM_GAP_PX) + SLICER_PAD_PX + 4 };
+  // scrolling: no spare room under the last row shown, or the next row peeks in
+  return { columnCount, rows, heightPx: rows * (SLICER_ITEM_PX + ACTION_ITEM_GAP_PX) + SLICER_PAD_PX + (allRows > rows ? 0 : 4) };
 }
 /** TWB derivations of a date a slicer key can be built from (YEAR, QUARTER, MONTH, DAY, and their truncated forms) */
 const SLICER_DATE_PARTS = new Set(["yr", "qr", "mn", "dy", "wd", "wk", "tyr", "tqr", "tmn", "twk", "tdy"]);
@@ -14281,7 +14289,8 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
     /**
      * A filter action (click a mark of the source sheet → filter the target sheets) → an "action" field: the source
      * field's values in a little table of their own, filtered by a slicer drawn over the source chart; the target
-     * visuals keep the rows whose value it still shows. Returns the field, or the reason there is none.
+     * visuals keep the rows whose value it still shows. Returns the field, { covered } when a filter card of the same
+     * field already filters the visuals, or the reason there is none.
      * @param {{ ref: FieldRef, header: string, targets: Set<string>, source: string }} spec @param {any} ws the source worksheet
      * @param {FormatModel} model
      */
@@ -14301,6 +14310,9 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
       const isDate = /date/.test(source.columns[col].dataType);
       if (deriv !== "none" && deriv !== "attr" && !isDate) return `"${ref.name}" holds no dates`;
       const d = deriv === "attr" ? "none" : deriv;
+      // a filter card of the same field already filters every visual (its slicer / dropdown): no second control
+      const card = fields.find(f => (f.kind === "slicer" || f.kind === "list") && f.srcCol === undefined && f.col === col && f.deriv === d);
+      if (card) return { covered: card.header };
       const values = source.rows.map(r => slicerRowText(r[col], d, isDate) ?? "");
       const items = [...new Set(values)].filter(v => v !== "\u0000").sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
       if (!items.length || items.length > FORMAT_CONFIG.actionSlicerMaxItems) return `${items.length} values (an action slicer holds up to ${FORMAT_CONFIG.actionSlicerMaxItems})`;
@@ -15052,6 +15064,70 @@ function writeControlCard(worksheet, item, tracker) {
   }
 }
 
+/* the action slicers' look: flat chips – the values a slicer lets through light blue, the others white with grey
+ * text, values with no rows left greyer still; no frame (Excel's default style boxes every button in grey) */
+const ACTION_SLICER_STYLE = "TfxChips";
+/** element → [fill, border, font] RRGGBB */
+const ACTION_SLICER_LOOK = {
+  unselectedItemWithData: ["FFFFFF", "D9D9D9", "7F7F7F"],
+  selectedItemWithData: ["DEEAF6", "9DC3E6", "1F4E79"],
+  unselectedItemWithNoData: ["FFFFFF", "EDEDED", "C8C8C8"],
+  selectedItemWithNoData: ["F2F2F2", "E0E0E0", "A6A6A6"],
+  hoveredUnselectedItemWithData: ["F3F7FB", "9DC3E6", "404040"],
+  hoveredSelectedItemWithData: ["C9DDF2", "5B9BD5", "1F4E79"],
+  hoveredUnselectedItemWithNoData: ["F7F7F7", "D9D9D9", "BFBFBF"],
+  hoveredSelectedItemWithNoData: ["EDEDED", "BFBFBF", "A6A6A6"]
+};
+
+/**
+ * styles.xml with the action slicers' style, as Excel writes a custom slicer style: a table style of the same name
+ * (pivot="0" table="0": the frame and caption, in <dxfs>) and the buttons' looks in the x14 slicer style (in
+ * <x14:dxfs>). Unchanged when the style is there already (another dashboard's slicers added it).
+ * @param {string} xml @returns {string}
+ */
+function addActionSlicerStyle(xml) {
+  if (xml.includes(`name="${ACTION_SLICER_STYLE}"`)) return xml;
+  const NS_X14 = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+  const rgb = c => `<color rgb="FF${c}"/>`;
+  const dxf = (fill, border, font) => `<dxf>${font ? `<font>${rgb(font)}</font>` : ""}` +
+    `<fill><patternFill patternType="solid"><fgColor rgb="FF${fill}"/><bgColor rgb="FF${fill}"/></patternFill></fill>` +
+    (border ? `<border>${["left", "right", "top", "bottom"].map(e => `<${e} style="thin">${rgb(border)}</${e}>`).join("")}</border>` : "<border/>") + `</dxf>`;
+  // the frame: white, no border; the caption (hidden on action slicers) grey
+  const frame = [dxf("FFFFFF", null, null), dxf("FFFFFF", null, "595959")];
+  let base = 0;
+  const dx = xml.match(/<dxfs count="(\d+)"\s*\/>|<dxfs count="(\d+)">([\s\S]*?)<\/dxfs>/);
+  if (dx) {
+    base = +(dx[1] || dx[2]);
+    xml = xml.replace(dx[0], `<dxfs count="${base + 2}">${dx[3] || ""}${frame.join("")}</dxfs>`);
+  } else xml = xml.replace(/<tableStyles\b/, `<dxfs count="2">${frame.join("")}</dxfs><tableStyles`);
+  const tableStyle = `<tableStyle name="${ACTION_SLICER_STYLE}" pivot="0" table="0" count="2">` +
+    `<tableStyleElement type="wholeTable" dxfId="${base}"/><tableStyleElement type="headerRow" dxfId="${base + 1}"/></tableStyle>`;
+  const ts = xml.match(/<tableStyles count="(\d+)"([^>]*?)\/>|<tableStyles count="(\d+)"([^>]*)>([\s\S]*?)<\/tableStyles>/);
+  if (ts) xml = xml.replace(ts[0], ts[0].endsWith("/>") ? `<tableStyles count="${+ts[1] + 1}"${ts[2]}>${tableStyle}</tableStyles>`
+                                                        : `<tableStyles count="${+ts[3] + 1}"${ts[4]}>${ts[5]}${tableStyle}</tableStyles>`);
+  else xml = xml.replace(/<\/dxfs>|<dxfs count="\d+"\/>/, m => m + `<tableStyles count="1">${tableStyle}</tableStyles>`);
+  // the buttons: x14 dxfs (after any there are)
+  const looks = Object.entries(ACTION_SLICER_LOOK);
+  let x14base = 0;
+  const x14 = xml.match(/<x14:dxfs count="(\d+)">([\s\S]*?)<\/x14:dxfs>/);
+  const lookDxfs = looks.map(([, [f, b, t]]) => dxf(f, b, t)).join("");
+  if (x14) { x14base = +x14[1]; xml = xml.replace(x14[0], `<x14:dxfs count="${x14base + looks.length}">${x14[2]}${lookDxfs}</x14:dxfs>`); }
+  const style = `<x14:slicerStyle name="${ACTION_SLICER_STYLE}"><x14:slicerStyleElements>` +
+    looks.map(([type], i) => `<x14:slicerStyleElement type="${type}" dxfId="${x14base + i}"/>`).join("") + `</x14:slicerStyleElements></x14:slicerStyle>`;
+  const dxfsExt = x14 ? "" : `<ext uri="{46F421CA-312F-682f-3DD2-61675219B42D}" xmlns:x14="${NS_X14}"><x14:dxfs count="${looks.length}">${lookDxfs}</x14:dxfs></ext>`;
+  const ss = xml.match(/<x14:slicerStyles\b([^>]*?)\/>|<x14:slicerStyles\b([^>]*)>([\s\S]*?)<\/x14:slicerStyles>/);
+  if (ss) {
+    xml = xml.replace(ss[0], ss[0].endsWith("/>") ? `<x14:slicerStyles${ss[1]}>${style}</x14:slicerStyles>` : `<x14:slicerStyles${ss[2]}>${ss[3]}${style}</x14:slicerStyles>`);
+    // the dxfs' ext before the slicer styles' (Excel's order)
+    if (dxfsExt) xml = xml.replace(/<ext uri="\{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C\}"/, m => dxfsExt + m);
+  } else {
+    const ext = dxfsExt + `<ext uri="{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C}" xmlns:x14="${NS_X14}"><x14:slicerStyles defaultSlicerStyle="SlicerStyleLight1">${style}</x14:slicerStyles></ext>`;
+    xml = xml.includes("</extLst></styleSheet>") ? xml.replace("</extLst></styleSheet>", ext + "</extLst></styleSheet>")
+                                                  : xml.replace("</styleSheet>", `<extLst>${ext}</extLst></styleSheet>`);
+  }
+  return xml;
+}
+
 /**
  * Adds the slicer table, the slicer caches and the slicers (drawn where the filter cards were) to a written XLSX –
  * the parts Excel itself writes for a table slicer.
@@ -15165,7 +15241,7 @@ async function injectSlicers(buffer, plan) {
     const n = nextFreeIndex(zip, "xl/slicers/slicer", ".xml");
     zip.file(`xl/slicers/slicer${n}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
       `<slicers xmlns="${NS_X14}" xmlns:mc="${NS.mc}" mc:Ignorable="x" xmlns:x="${NS_MAIN}">` +
-      own.map(s => `<slicer name="${esc(s.name)}" cache="${esc(s.cache)}" caption="${esc(s.caption)}"${s.noCaption ? ' showCaption="0"' : ""} columnCount="${s.columnCount}" rowHeight="${SLICER_ITEM_PX * EMU_PER_PX}"/>`).join("") +
+      own.map(s => `<slicer name="${esc(s.name)}" cache="${esc(s.cache)}" caption="${esc(s.caption)}"${s.noCaption ? ' showCaption="0"' : ""}${s.style ? ` style="${s.style}"` : ""} columnCount="${s.columnCount}" rowHeight="${SLICER_ITEM_PX * EMU_PER_PX}"/>`).join("") +
       `</slicers>`);
     ct = addOverride(ct, `xl/slicers/slicer${n}.xml`, "application/vnd.ms-excel.slicer+xml");
     const slicerRid = nextRelId(sheetRels);
@@ -15192,7 +15268,7 @@ async function injectSlicers(buffer, plan) {
     const used = [...drawingXml.matchAll(/<xdr:cNvPr\b[^>]*\sid="(\d+)"/g)].map(m => +m[1]);
     let shapeId = (used.length ? Math.max(...used) : 1) + 1;
     const marker = (tag, p) => `<xdr:${tag}><xdr:col>${p.col}</xdr:col><xdr:colOff>${p.colOff}</xdr:colOff><xdr:row>${p.row}</xdr:row><xdr:rowOff>${p.rowOff}</xdr:rowOff></xdr:${tag}>`;
-    const anchors = own.map(s => `<xdr:twoCellAnchor editAs="oneCell">${marker("from", s.from)}${marker("to", s.to)}` +
+    const anchors = own.map(s => `<xdr:twoCellAnchor editAs="${s.editAs || "oneCell"}">${marker("from", s.from)}${marker("to", s.to)}` +
       `<mc:AlternateContent xmlns:mc="${NS.mc}"><mc:Choice xmlns:sle15="http://schemas.microsoft.com/office/drawing/2012/slicer" Requires="sle15">` +
       `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${shapeId++}" name="${esc(s.name)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
       `<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2010/slicer">` +
@@ -15206,6 +15282,10 @@ async function injectSlicers(buffer, plan) {
     zip.file(drawingPath, drawingXml);
     zip.file(sheetPath, sheetXml);
     zip.file(relsPathOf(sheetPath), sheetRels);
+  }
+  if (plan.slicers.some(s => s.style === ACTION_SLICER_STYLE)) {
+    const styles = await read("xl/styles.xml");
+    if (styles) zip.file("xl/styles.xml", addActionSlicerStyle(styles));
   }
   zip.file("[Content_Types].xml", ct);
   return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
@@ -16271,6 +16351,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
               const info = tfFieldInfo(fmtModel, ref);
               const field = await slicers.adoptAction({ ref, header: `${(info && info.caption) || ref.name} (${item.visualName || src})`, targets, source: src }, ws, fmtModel);
               if (typeof field === "string") { why = field; continue; }
+              if (field.covered) { why = `the "${field.covered}" filter card filters by it already`; break; }
               actionSlicers.push({ field, source: src, caption: a.caption || `Filter by ${src}` });
               break;
             }
@@ -16501,6 +16582,14 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       const size = actionSlicerSize(a.field, (it.layout && it.layout.widthPx) || it.gridW * EXCEL_COL_PX);
       const rows = Math.max(2, Math.ceil((size.heightPx + ACTION_BAND_GAP_PX) / EXCEL_ROW_PX));
       it.allocatedRows += rows; it.actionBand = rows;
+    });
+    // the blocks of the same row get the same band (theirs empty): the titles stay level, and the band's rows hold
+    // nothing else – hiding them (a row group) hides only slicers
+    const bandAt = new Map();
+    placedItems.forEach(it => { if (it.actionBand) bandAt.set(it.gridRow, Math.max(bandAt.get(it.gridRow) || 0, it.actionBand)); });
+    placedItems.forEach(it => {
+      const band = bandAt.get(it.gridRow);
+      if (band && band > (it.actionBand || 0)) { it.allocatedRows += band - (it.actionBand || 0); it.actionBand = band; }
     });
     resolveCollisions(placedItems);
 
@@ -17195,7 +17284,7 @@ setTableVisibleRows(placedItems);
                              return { col: n.nativeCol, colOff: n.nativeColOff, row: n.nativeRow, rowOff: n.nativeRowOff }; };
       let band = 0;
       for (let r = top; r < item.gridRow; r++) band += rowPx(r);
-      return { sheetName: worksheet.name, field: a.field, caption: a.caption, noCaption: true, columnCount,
+      return { sheetName: worksheet.name, field: a.field, caption: a.caption, noCaption: true, columnCount, editAs: "twoCell", style: ACTION_SLICER_STYLE,
                from: at(0, 1), to: at(Math.max(60, w), Math.max(20, Math.min(band - ACTION_BAND_GAP_PX, heightPx))) };
     }).filter(Boolean));
 
@@ -17255,12 +17344,22 @@ setTableVisibleRows(placedItems);
 
     if (filterStates) filterStates.finish();
     // an action slicer's band: rows of the usual height (a slicer button needs about 20 px), whatever the rows beside
-    // it were sized to
+    // it were sized to. Its rows are a row group, open: the [–] in the margin (or the outline's level 1) hides the
+    // band and its slicer (drawn to move and size with the rows) – the charts close up under each other
     adjustedItems.filter(it => it.actionBand).forEach(it => {
-      for (let r = it.gridRow - it.actionBand; r < it.gridRow; r++) {
+      const top = it.gridRow - it.actionBand;
+      for (let r = top; r < it.gridRow; r++) {
         const row = worksheet.getRow(r + 1);
         row.height = Math.max(row.height || 0, EXCEL_ROW_PX * 0.75);
       }
+      // not next to another group (a long table's hidden rows): Excel would join the two
+      const grouped = r => r >= 0 && !!worksheet.getRow(r + 1).outlineLevel;
+      // nor over another block's rows (a tall block beside it): hiding them would cut that block
+      const crossed = adjustedItems.some(x => x.gridRow < it.gridRow && x.gridRow + (x.allocatedRows || 0) > top);
+      if (!FORMAT_CONFIG.actionBandGroups || crossed || grouped(top - 1) || grouped(it.gridRow)) return;
+      for (let r = top; r < it.gridRow; r++) worksheet.getRow(r + 1).outlineLevel = 1;
+      // the [–] on the row above the band (as the long tables' groups)
+      worksheet.properties.outlineProperties = { summaryBelow: false, summaryRight: false };
     });
     return { worksheet, dashboardName, visualStatuses, workbookWarning, report, finalizeCharts, finalizeSlicers };
 }
