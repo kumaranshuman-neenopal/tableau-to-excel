@@ -156,7 +156,7 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
       }
       if (!c) return;
       if (AGG[d]) meas.push({ r, c, agg: d });
-      else if (d === "none" || d === "attr" || /^(yr|qr|mn|dy|tyr|tqr|tmn|tdy)$/.test(d)) dims.push({ r, c, d });
+      else if (d === "none" || d === "attr" || /^(yr|qr|mn|dy|wd|wk|tyr|tqr|tmn|twk|tdy)$/.test(d)) dims.push({ r, c, d });
     });
     if (!dims.length && !meas.length) return { columns: [], data: [] };
     const s = (dims[0] || meas[0]).c.s;
@@ -165,8 +165,12 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
     const kept = row => [...active.entries()].every(([fn, set]) => { const i = s.cols.findIndex(c => c.caption === fn || c.name === fn); return i < 0 || set.has(txt(row[i])); });
     s.rows.forEach((row, ri) => {
       if (!kept(row)) return;
-      const part = (x, v) => { if (!(v instanceof Date) || !/^(yr|qr|mn|dy|tyr|tqr|tmn|tdy)$/.test(x.d)) return v; const y = v.getUTCFullYear(), m = v.getUTCMonth();
-        return x.d === "yr" ? y : x.d === "qr" ? Math.floor(m / 3) + 1 : x.d === "mn" ? m + 1 : x.d === "dy" ? v.getUTCDate() : x.d === "tyr" ? new Date(Date.UTC(y, 0, 1)) : x.d === "tqr" ? new Date(Date.UTC(y, m - m % 3, 1)) : x.d === "tmn" ? new Date(Date.UTC(y, m, 1)) : v; };
+      const part = (x, v) => { if (!(v instanceof Date) || !/^(yr|qr|mn|dy|wd|wk|tyr|tqr|tmn|twk|tdy)$/.test(x.d)) return v; const y = v.getUTCFullYear(), m = v.getUTCMonth();
+        return x.d === "yr" ? y : x.d === "qr" ? Math.floor(m / 3) + 1 : x.d === "mn" ? m + 1 : x.d === "dy" ? v.getUTCDate() : x.d === "tyr" ? new Date(Date.UTC(y, 0, 1)) : x.d === "tqr" ? new Date(Date.UTC(y, m - m % 3, 1)) : x.d === "tmn" ? new Date(Date.UTC(y, m, 1))
+          // WEEKDAY as Tableau's summary data gives it (the day's name), WEEK as its number, a week by its Sunday
+          : x.d === "wd" ? ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][v.getUTCDay()]
+          : x.d === "wk" ? Math.floor(((v - Date.UTC(y, 0, 1)) / 86400000 + new Date(Date.UTC(y, 0, 1)).getUTCDay()) / 7) + 1
+          : x.d === "twk" ? new Date(v.getTime() - v.getUTCDay() * 86400000) : v; };
       const k = JSON.stringify(dims.map(x => x.c.s === s ? part(x, row[x.c.i]) : null));
       (groups.get(k) || groups.set(k, []).get(k)).push(row);
       (idx.get(k) || idx.set(k, []).get(k)).push(ri);

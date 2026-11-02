@@ -7,7 +7,7 @@ const assert = require("node:assert/strict");
 const { load } = require("./lib/load.js");
 
 const T = load({ dashboard: {}, captureDownload: () => {},
-  expose: ["createSlicerModel", "tfParseFieldRef", "tfIsNull", "slicerParseCalc", "slicerEval", "slicerExcel"] });
+  expose: ["createSlicerModel", "tfParseFieldRef", "tfIsNull", "slicerParseCalc", "slicerEval", "slicerExcel", "slicerDatePart", "slicerMarkText"] });
 console.log = console.info = () => {};
 
 const dv = (v, f) => ({ value: v, nativeValue: v, formattedValue: f === undefined ? String(v) : f });
@@ -40,6 +40,18 @@ test("calculations of aggregates: functions, conditions, parameters", () => {
     assert.ok(Math.abs(T.slicerEval(e, [0, 1, 2], src, null) - value) < 1e-9, `value of ${formula}`);
     if (excel) assert.equal(T.slicerExcel(e, R, "1"), excel, `Excel formula of ${formula}`);
   }
+});
+
+test("weekday and week levels: Tableau's weeks (Sunday first, week 1 holds 1 January)", () => {
+  const d = (y, m, dd) => ({ y, m, d: dd });
+  assert.deepEqual(["wd", "wk", "twk"].map(p => T.slicerDatePart(d(2024, 1, 1), p)), ["Monday", "1", "2023-12-31"]);
+  assert.deepEqual(["wd", "wk", "twk"].map(p => T.slicerDatePart(d(2024, 1, 7), p)), ["Sunday", "2", "2024-01-07"]);
+  assert.equal(T.slicerDatePart(d(2025, 12, 31), "wk"), "53");
+  // the summary data's WEEKDAY: a name or 1–7 (1 = Sunday) – the same key as the rows'
+  assert.equal(T.slicerMarkText(dv("Monday"), "wd", true), "Monday");
+  assert.equal(T.slicerMarkText(dv(2, "Monday"), "wd", true), "Monday");
+  assert.equal(T.slicerMarkText(dv(1), "wd", true), "Sunday");
+  assert.equal(T.slicerMarkText(dv(14), "wk", true), "14");
 });
 
 /* ── filter cards: a little data source of 48 rows ───────────────────────────────────────────────────────────── */
@@ -85,6 +97,7 @@ const CASES = [
   ["range of SUM(Sales)", "sum:Sales:qk", range("SUM(Sales)", dv(100), dv(5000)), null, "marks", null],
   ["range of YEAR(Order Date)", "yr:Order Date:qk", range("YEAR(Order Date)", dv(2024), dv(2024)), null, "range", 24],
   ["range of months", "tmn:Order Date:qk", range("MONTH(Order Date)", day(2024, 0, 1), day(2024, 5, 1)), null, "range", 12],
+  ["WEEKDAY(Order Date)", "wd:Order Date:ok", cat("WEEKDAY(Order Date)", [dv("Monday")]), "dropdown", "list", null],
   ["relative: last 3 months", "none:Order Date:qk", { fieldName: "Order Date", filterType: "relative-date", periodType: "months", rangeType: "lastn", rangeN: 3, anchorDate: dv("2024-06-15") }, null, "range", 4],
   ["relative: year to date", "none:Order Date:qk", { fieldName: "Order Date", filterType: "relative-date", periodType: "years", rangeType: "todate", anchorDate: dv("2024-06-15") }, null, "range", 12],
   ["hierarchical (cube)", "none:Region:nk", { fieldName: "Region", filterType: "hierarchical" }, null, "text", null]

@@ -8082,6 +8082,101 @@ function appendExportNotes(notes) {
 }
 
 
+/* ═══ ui/checks.js ═══════════════════════════════════════════════════════════════════════════════ */
+/* What the panel can tell before an export – and what the export did. Before: the extension squeezing the dashboard
+ * (tiled, not floating), filter cards set to some values (every value is included, Excel opens at that selection),
+ * the loaded workbook not matching, cards of a second data source. After: how many visuals follow the filters, and
+ * why the others keep Tableau's values. Lines under the status: ⚠ needs a look, ℹ worth knowing, ✅ fine. */
+
+/** @typedef {{ level: "warn" | "info" | "ok", text: string, tip?: string }} CheckLine */
+
+/** the checks of the dashboard as it is now @param {any} dashboard @returns {Promise<CheckLine[]>} */
+async function preExportChecks(dashboard) {
+  /** @type {CheckLine[]} */
+  const out = [];
+  const model = FORMAT_MODEL_CACHE;
+  // the extension's own zone: tiled, Tableau takes its room from the dashboard's other zones (rows squeezed)
+  const tiled = (dashboard.objects || []).filter(o => o.type === "extension" && o.isVisible !== false && !o.isFloating &&
+                                                      o.size && o.size.width * o.size.height > 2000);
+  if (tiled.length) out.push({ level: "warn", text: "The extension is tiled: Tableau takes its room from the charts, so the export's rows come out squeezed. Make it floating (Layout → Floating) and move it to a corner.",
+                               tip: "Select the extension object on the dashboard, then Floating in the Objects / Layout pane." });
+  if (!model) out.push({ level: "warn", text: "No workbook loaded: charts would be exported as tables. Load the .twbx with 📁." });
+  else {
+    const warning = describeWorkbookMatch(checkWorkbookMatch(model, dashboard));
+    if (warning) out.push({ level: "warn", text: warning + " – load this dashboard's own workbook." });
+  }
+  const dash = model && model.dashboards && model.dashboards[dashboard.name];
+  if (dash) {
+    // the cards' data sources: slicers filter one per dashboard
+    const sources = [...new Set(dash.zones.filter(z => z.type === "filter" && z.param && !z.hidden)
+      .map(z => (tfParseFieldRef(z.param) || {}).ds).filter(ds => ds && ds !== "Parameters"))];
+    if (sources.length > 1) out.push({ level: "info", text: `Filter cards of ${sources.length} data sources: the cards of the first one become slicers / dropdowns, the others stay text.` });
+    // cards set to some values (Tableau's filters, read live)
+    const norm = x => tfNorm(x).replace(/[^a-z0-9]/g, "");
+    const cardFields = new Set();
+    dash.zones.filter(z => z.type === "filter" && z.param && !z.hidden).forEach(z => {
+      const ref = tfParseFieldRef(z.param), info = ref && tfFieldInfo(model, ref);
+      [info && info.caption, ref && ref.name].filter(Boolean).forEach(n => cardFields.add(norm(n)));
+    });
+    const set = new Map();
+    for (const ws of dashboard.worksheets || []) {
+      let filters = [];
+      try { filters = typeof ws.getFiltersAsync === "function" ? (await ws.getFiltersAsync()) || [] : []; } catch (e) { filters = []; }
+      filters.forEach(f => {
+        if (String(f.filterType || "").toLowerCase() !== "categorical" || f.isAllSelected || !cardFields.has(norm(f.fieldName))) return;
+        const vals = (f.appliedValues || []).map(v => tfDvText(v)).filter(Boolean);
+        set.set(f.fieldName, (f.isExcludeMode ? "all except " : "") + (vals.slice(0, 3).join(", ") + (vals.length > 3 ? ` (+${vals.length - 3})` : "") || "(none)"));
+      });
+    }
+    if (set.size) {
+      const list = [...set].map(([k, v]) => `${k} = ${v}`).join("; ");
+      out.push({ level: "info", text: FORMAT_CONFIG.exportAllValues
+        ? `${list}: every value goes into the file and Excel opens at this selection – widen it there to see the rest.`
+        : `${list}: the file holds only these values – set the cards to (All) first to have every value.` });
+    }
+  }
+  if (!out.some(l => l.level === "warn")) out.unshift({ level: "ok", text: "Ready to export." });
+  return out;
+}
+
+/** after an export: which visuals follow the filters, which keep Tableau's values and why
+ * @param {any[]} written the dashboards written (their report) @returns {CheckLine[]} */
+function exportSummaryChecks(written) {
+  const multi = written.length > 1;
+  const all = written.flatMap(w => ((w.report && w.report.slicers) || []).map(s => ({ ...s, worksheet: multi ? `${w.dashboardName} / ${s.worksheet}` : s.worksheet })));
+  if (!all.length) return [];
+  const fixed = all.filter(s => !s.follows);
+  /** @type {CheckLine[]} */
+  const out = [{ level: fixed.length ? "info" : "ok", text: `${all.length - fixed.length} of ${all.length} visuals follow the filters in Excel.` }];
+  fixed.slice(0, 6).forEach(s => out.push({ level: "info", text: `${s.worksheet} keeps Tableau's values: ${String(s.note).replace(/^fixed values: /, "")}` }));
+  if (fixed.length > 6) out.push({ level: "info", text: `… and ${fixed.length - 6} more – see the Conversion Report sheet.` });
+  return out;
+}
+
+/** the checks area under the status line (made when missing) @param {CheckLine[]} lines @param {string} title */
+function showChecks(lines, title) {
+  let box = document.getElementById("export_checks");
+  const status = document.getElementById("export_status");
+  if (!box && status && status.parentNode) {
+    box = document.createElement("div");
+    box.id = "export_checks";
+    box.style.cssText = "margin-top:8px;font-size:0.82em;line-height:1.35;white-space:pre-line;word-break:break-word;";
+    status.parentNode.insertBefore(box, status.nextSibling);
+  }
+  if (!box) return;
+  const icon = { warn: "⚠️", info: "ℹ️", ok: "✅" };
+  box.textContent = (title ? title + "\n" : "") + lines.map(l => `${icon[l.level]} ${l.text}`).join("\n");
+  box.title = lines.map(l => l.tip).filter(Boolean).join("\n");
+  box.style.color = lines.some(l => l.level === "warn") ? "#9a5b00" : "";
+}
+
+/** runs the checks and shows them (never throws: the panel works without them) @param {any} dashboard */
+async function refreshChecks(dashboard) {
+  try { showChecks(await preExportChecks(dashboard), "Before export:"); }
+  catch (e) { console.warn("[Checks]", e.message); }
+}
+
+
 /* ═══ cloud/backend.js ════════════════════════════════════════════════════════════════════════════ */
 /* =============================================================================
  * AUTO-FETCH FROM TABLEAU CLOUD (Phase 1)
@@ -8095,9 +8190,9 @@ function appendExportNotes(notes) {
  * ============================================================================= */
 
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
-const EXTENSION_VERSION = "2.1.0";
+const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-02 52373e76";
+const EXTENSION_BUILD = "2026-11-02 ba3aa91c";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -13118,7 +13213,9 @@ function slicerRelativeRange(f) {
 /* a slicer as Excel draws it (default style): its caption, its buttons, a little padding; px */
 const SLICER_HEADER_PX = 34, SLICER_ITEM_PX = 26, SLICER_PAD_PX = 10, SLICER_ITEM_MIN_W_PX = 90, SLICER_MAX_ITEM_ROWS = 8;
 /** TWB derivations of a date a slicer key can be built from (YEAR, QUARTER, MONTH, DAY, and their truncated forms) */
-const SLICER_DATE_PARTS = new Set(["yr", "qr", "mn", "dy", "tyr", "tqr", "tmn", "tdy"]);
+const SLICER_DATE_PARTS = new Set(["yr", "qr", "mn", "dy", "wd", "wk", "tyr", "tqr", "tmn", "twk", "tdy"]);
+/** WEEKDAY's names, Sunday first (Tableau's default week; WEEKDAY as a number: 1 = Sunday) */
+const SLICER_WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 /** Tableau aggregations → the slicer formulas' aggregations */
 const SLICER_AGGS = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "COUNT", ctd: "COUNTD" };
 
@@ -13134,7 +13231,12 @@ function slicerDate(dv) {
 /** @param {{ y: number, m: number, d: number }} d @param {string} deriv */
 function slicerDatePart(d, deriv) {
   const two = n => String(n).padStart(2, "0");
+  const at = Date.UTC(d.y, d.m - 1, d.d), dow = new Date(at).getUTCDay();
   switch (deriv) {
+    case "wd": return SLICER_WEEKDAYS[dow];
+    // WEEK: weeks start on Sunday, week 1 holds 1 January (Tableau's default)
+    case "wk": { const jan1 = Date.UTC(d.y, 0, 1); return String(Math.floor(((at - jan1) / 86400000 + new Date(jan1).getUTCDay()) / 7) + 1); }
+    case "twk": { const t = new Date(at - dow * 86400000); return `${t.getUTCFullYear()}-${two(t.getUTCMonth() + 1)}-${two(t.getUTCDate())}`; }
     case "yr": case "tyr": return String(d.y);
     case "qr": return String(Math.ceil(d.m / 3));
     case "tqr": return `${d.y}-Q${Math.ceil(d.m / 3)}`;
@@ -13161,7 +13263,13 @@ function slicerRowText(dv, deriv, isDate) {
 function slicerMarkText(dv, deriv, isDate) {
   if (tfIsNull(dv)) return "\u0000";
   const v = dv.nativeValue !== undefined ? dv.nativeValue : dv.value;
-  if (/^(yr|qr|mn|dy)$/.test(deriv) && !(v instanceof Date)) {
+  if (deriv === "wd" && !(v instanceof Date)) {                 // "Monday", "Mon" or 2 (1 = Sunday)
+    const r = tfCalendarRank(tfDvText(dv));
+    if (r && r.kind === "weekday") return SLICER_WEEKDAYS[r.rank];
+    const n = typeof v === "number" ? v : Number(String(v).trim());
+    return n >= 1 && n <= 7 ? SLICER_WEEKDAYS[Math.round(n) - 1] : null;
+  }
+  if (/^(yr|qr|mn|dy|wk)$/.test(deriv) && !(v instanceof Date)) {
     const text = tfDvText(dv).trim();
     if (deriv === "mn") { const r = tfCalendarRank(text); if (r && r.kind === "month") return String(r.rank + 1); }
     if (deriv === "qr") { const q = text.match(/^Q?\s*([1-4])$/i); if (q) return q[1]; }
@@ -14245,6 +14353,8 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
           const d = tfIsNull(r[col]) ? null : slicerDate(r[col]);
           if (!d) return null;
           if (deriv === "tyr") return new Date(Date.UTC(d.y, 0, 1));
+          if (deriv === "twk") return new Date(`${slicerDatePart(d, "twk")}T00:00:00Z`);
+          if (deriv === "wd") return new Date(Date.UTC(d.y, d.m - 1, d.d)).getUTCDay() + 1;   // 1 = Sunday
           if (deriv === "tqr") return new Date(Date.UTC(d.y, d.m - 1 - ((d.m - 1) % 3), 1));
           if (deriv === "tmn") return new Date(Date.UTC(d.y, d.m - 1, 1));
           return Number(slicerDatePart(d, deriv));
@@ -15141,9 +15251,10 @@ async function readEveryValue(sheets, fmtModel, dashboard) {
  * The marks of the every-value data that a visual following the filters does not have yet: added to its rows (a pie:
  * its model rebuilt from that data), their source rows keyed (binding.extend). Charts are drawn again from the
  * rows; a table's block grows by its new rows. Matrices, KPI tiles and Tableau-computed visuals keep their marks.
- * @param {any[]} items @param {{ data: Map<string, any> }} everyValue @param {FormatModel} fmtModel
+ * A pie's legend cards (legendItems) list its new slices too.
+ * @param {any[]} items @param {{ data: Map<string, any> }} everyValue @param {FormatModel} fmtModel @param {any[]} [legendItems]
  */
-function addEveryValueMarks(items, everyValue, fmtModel) {
+function addEveryValueMarks(items, everyValue, fmtModel, legendItems = []) {
   for (const item of items) {
     const b = item.vm && item.vm.slicerBinding, all = everyValue.data.get(item.name);
     if (!b || typeof b.extend !== "function" || b.states || !all) continue;
@@ -15159,8 +15270,13 @@ function addEveryValueMarks(items, everyValue, fmtModel) {
         const more = wide.points.filter(p => !known.has(keyOf(wide.data[p.row])));
         if (!more.length) continue;
         b.extend(more.map(p => wide.data[p.row]));
-        const keep = { slicerBinding: pie.slicerBinding, rebuild: pie.rebuild };
+        // the legend cards drawn from this pie hold its legend objects: those take the new entries (and their blocks
+        // grow by them)
+        const legends = [[pie.legend, wide.legend], [pie.inner && pie.inner.legend, wide.inner && wide.inner.legend]].filter(([a, w]) => a && w);
+        legends.forEach(([a, w]) => Object.assign(a, w));
+        const keep = { slicerBinding: pie.slicerBinding, rebuild: pie.rebuild, legend: pie.legend };
         Object.assign(pie, wide, keep);
+        legendItems.forEach(li => { if (legends.some(([a]) => li.legend === a)) li.rowCount = 1 + li.legend.items.length; });
         console.log(`[Every value] ${item.name}: ${more.length} more slice(s)`);
         continue;
       }
@@ -15612,6 +15728,7 @@ async function exportToExcel() {
     console.log(`[Timing] ${timing}`);
     if (FORMAT_CONFIG.showTiming) appendExportStatus(timing);
     appendExportNotes(notes);
+    showChecks(exportSummaryChecks(written), "This export:");
 
     console.log(`✅ Export completed with Tableau formatting and native charts — ${written.length} sheet(s): ${written.map(w => w.worksheet.name).join(", ")}`);
 
@@ -16203,7 +16320,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
           });
       }
     }
-    if (everyValue && slicers && slicers.active) addEveryValueMarks(dataWorksheetItems, everyValue, fmtModel);
+    if (everyValue && slicers && slicers.active) addEveryValueMarks(dataWorksheetItems, everyValue, fmtModel, pieLegendItems);
     // ── visuals the slicer formulas cannot rebuild: Tableau's own numbers for each dropdown value (read now, in Tableau)
     const filterStates = FORMAT_CONFIG.filterStates && fmtModel
       ? await addFilterStates({ workbook, sheetName, sheets, dataWorksheetItems, filterValueItems, slicers }) : null;
@@ -17207,6 +17324,15 @@ document.addEventListener("DOMContentLoaded", () => {
         finally { EXPORT_RUNNING = false; refreshExportButton(); }
       });
     }
+
+    // the checks: once the workbook is loaded, and again when a filter changes (not during an export, which sets
+    // filters itself for a moment)
+    WORKBOOK_READY.then(() => refreshChecks(dashboard));
+    let checkTimer = null;
+    const recheck = () => { if (EXPORT_RUNNING) return; clearTimeout(checkTimer); checkTimer = setTimeout(() => refreshChecks(dashboard), 400); };
+    (dashboard.worksheets || []).forEach(ws => {
+      try { ws.addEventListener(tableau.TableauEventType.FilterChanged, recheck); } catch (e) { /* older API: checks at load only */ }
+    });
 
   }).catch((err) => {
     console.error("[Tableau init]", err);

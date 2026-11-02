@@ -50,6 +50,17 @@ test("Ecommerce exported at Channel = Website: the pie gets the other channels",
   assert.match(log, /\[Every value\] Revenue Share by Channel \(Pie\): 3 more slice\(s\)/);
 });
 
+test("Ecommerce exported at Device Type = Mobile: the donut gets the other device types", { skip: skipEcom }, async () => {
+  const { log } = await exportOf(ECOM, "Gauge & Donut", { REALCSV: "1", SELECT: "Device Type=Mobile" }, "mobile.xlsx");
+  assert.match(log, /\[Every value\] Revenue by Device Type \(Donut\): 2 more slice\(s\)/);
+});
+
+test("Ecommerce heatmap (WEEKDAY × hour): every cell follows the slicers", { skip: skipEcom }, async () => {
+  const { log, file } = await exportOf(ECOM, "Sales Overview", { REALCSV: "1" }, "heatmap.xlsx");
+  assert.match(log, /Orders by Weekday and Hour \(Heatmap\): follows the slicers \(168 marks/);
+  assert.ok(file.visuals.find(v => /Heatmap/.test(v.worksheet)).follows);
+});
+
 test("Ecommerce Detail Analysis: the packed bubbles follow the slicers", { skip: skipEcom }, async () => {
   const { file } = await exportOf(ECOM, "Detail Analysis", { REALCSV: "1" }, "detail.xlsx");
   const bubbles = file.visuals.find(v => /Bubbles/.test(v.worksheet));
