@@ -8192,7 +8192,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-02 ba3aa91c";
+const EXTENSION_BUILD = "2026-11-02 bb65d18f";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -13154,7 +13154,7 @@ const SLICER_DATES_COL = "ZZ";                                    // …and, far
 const SLICER_BOUND_COL = "ZY";                                    // …and the Min / Max of the ranges of an aggregate
 const SLICER_TABLE = "SlicerData";
 const SLICER_ACTIONS_SHEET = "Slicer Actions";
-const ACTION_BAND_ROWS = 2;                                         // sheet rows an action slicer takes above its chart                   // the filter actions' value tables (action slicers)
+const ACTION_BAND_GAP_PX = 6;                                       // room under an action slicer, before its chart's title
 const SLICER_ALL = "(All)";
 
 /**
@@ -13212,6 +13212,23 @@ function slicerRelativeRange(f) {
 
 /* a slicer as Excel draws it (default style): its caption, its buttons, a little padding; px */
 const SLICER_HEADER_PX = 34, SLICER_ITEM_PX = 26, SLICER_PAD_PX = 10, SLICER_ITEM_MIN_W_PX = 90, SLICER_MAX_ITEM_ROWS = 8;
+/* an action slicer (no caption): buttons as wide as the longest value, up to this many rows shown (more scroll) */
+const ACTION_ITEM_GAP_PX = 6, ACTION_MAX_ROWS = 2;
+
+/** an action slicer across its chart: columns that fit the longest value without cutting it, rows of buttons
+ * (ACTION_MAX_ROWS at most, the rest scroll) and the height that shows them
+ * @param {{ items: string[] }} field @param {number} widthPx @returns {{ columnCount: number, rows: number, heightPx: number }} */
+function actionSlicerSize(field, widthPx) {
+  const n = Math.max(1, field.items.length);
+  const longest = Math.max(1, ...field.items.map(v => String(v).length));
+  const itemW = Math.max(64, Math.min(220, longest * 7 + 28));            // Calibri 11 ≈ 7 px a character, plus the button's padding
+  let columnCount = Math.max(1, Math.min(n, Math.floor((widthPx - 8) / (itemW + ACTION_ITEM_GAP_PX))));
+  const allRows = Math.ceil(n / columnCount);
+  // even rows when they all show (7 values in rows of 4 + 3, not 6 + 1); more than that scroll, as many to a row as fit
+  if (allRows <= ACTION_MAX_ROWS) columnCount = Math.ceil(n / allRows);
+  const rows = Math.min(ACTION_MAX_ROWS, allRows);
+  return { columnCount, rows, heightPx: rows * (SLICER_ITEM_PX + ACTION_ITEM_GAP_PX) + SLICER_PAD_PX + 4 };
+}
 /** TWB derivations of a date a slicer key can be built from (YEAR, QUARTER, MONTH, DAY, and their truncated forms) */
 const SLICER_DATE_PARTS = new Set(["yr", "qr", "mn", "dy", "wd", "wk", "tyr", "tqr", "tmn", "twk", "tdy"]);
 /** WEEKDAY's names, Sunday first (Tableau's default week; WEEKDAY as a number: 1 = Sunday) */
@@ -14228,7 +14245,7 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
     const c = `${getExcelColumnName(f.tableCol)}${R}`;
     if (f.kind === "list") return `OR(${f.control.cell}="${SLICER_ALL}",${c}=${f.control.cell})`;
     // an action: the row's value still shown by the action's slicer (its table: a value and Shown, SUBTOTAL(103))
-    if (f.kind === "action") return `IFERROR(INDEX(${f.selRange},MATCH(${c},${f.valRange},0))=1,TRUE)`;
+    if (f.kind === "action") return `IFERROR(INDEX(${f.selRange},MATCH(${f.numeric ? `VALUE(${c})` : c},${f.valRange},0))=1,TRUE)`;
     const from = (f.control && f.control.from) || String(f.lo), to = (f.control && f.control.to) || String(f.hi);
     return `IF(ISNUMBER(${c}),AND(OR(${from}="",${c}${f.loStrict ? ">" : ">="}${from}),OR(${to}="",${c}${f.hiStrict ? "<" : "<="}${to})),` +
            `${f.includeNull ? "TRUE" : "FALSE"})`;
@@ -14294,6 +14311,8 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
       /** @type {any} */
       const field = { kind: "action", col, deriv: d, isDate, header: uniqueHeader(spec.header), values, items, selected: null, tableCol: -1,
                       targets: spec.targets, source: spec.source, pass: () => true, index: k, row0,
+                      // whole numbers (hours, bins): numbers in its table, so the slicer sorts 2 before 10
+                      numeric: items.every(v => /^-?(0|[1-9]\d{0,14})$/.test(v)),
                       valRange: cellRef(actionSheet, 0, row0 + 1, 0, row0 + items.length), selRange: cellRef(actionSheet, 1, row0 + 1, 1, row0 + items.length) };
       columns.push({ header: field.header, values: values.map(v => (v === "\u0000" ? null : v)) });
       field.tableCol = columns.length + 1;
@@ -14775,8 +14794,8 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
           as.getCell(top, 2).value = "Shown";
           f.items.forEach((v, i) => {
             const cell = as.getCell(top + 1 + i, 1);
-            cell.value = v;
-            cell.numFmt = "@";
+            cell.value = f.numeric ? Number(v) : v;
+            if (!f.numeric) cell.numFmt = "@";
             as.getCell(top + 1 + i, 2).value = { formula: `SUBTOTAL(103,A${top + 1 + i})`, result: 1 };
           });
           actionTables.push({ field: f, sheetName: as.name, tableName: `${names.table}_A${f.index + 1}`, headers: [f.header, "Shown"],
@@ -16475,9 +16494,13 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     });
 
     // a filter action's source: a band of rows above its block for the action's slicer (the layout makes room for it)
-    const actionSources = new Set(actionSlicers.map(a => a.source));
+    // (its rows: as many as its buttons need, sized on the zone's width)
     placedItems.forEach(it => {
-      if (it.type === "worksheet" && actionSources.has(it.name)) { it.allocatedRows += ACTION_BAND_ROWS; it.actionBand = ACTION_BAND_ROWS; }
+      const a = it.type === "worksheet" && actionSlicers.find(x => x.source === it.name);
+      if (!a) return;
+      const size = actionSlicerSize(a.field, (it.layout && it.layout.widthPx) || it.gridW * EXCEL_COL_PX);
+      const rows = Math.max(2, Math.ceil((size.heightPx + ACTION_BAND_GAP_PX) / EXCEL_ROW_PX));
+      it.allocatedRows += rows; it.actionBand = rows;
     });
     resolveCollisions(placedItems);
 
@@ -17166,14 +17189,14 @@ setTableVisibleRows(placedItems);
       const top = item.gridRow - item.actionBand;                 // its band, above the block
       let w = 0;
       for (let c = item.gridCol; c < item.gridCol + item.gridW; c++) w += colPx(c);
-      // one row of buttons across the chart (no caption: the chart's title says what it is), scrolling when more
-      const columnCount = Math.max(1, Math.min(a.field.items.length, Math.floor(w / SLICER_ITEM_MIN_W_PX)));
+      // buttons across the chart, a few rows of them (no caption: the chart's title says what it is), scrolling when more
+      const { columnCount, heightPx } = actionSlicerSize(a.field, w);
       const at = (x, y) => { const n = nativeAnchor(item.gridCol, top, x, y, colPx, rowPx);
                              return { col: n.nativeCol, colOff: n.nativeColOff, row: n.nativeRow, rowOff: n.nativeRowOff }; };
       let band = 0;
       for (let r = top; r < item.gridRow; r++) band += rowPx(r);
       return { sheetName: worksheet.name, field: a.field, caption: a.caption, noCaption: true, columnCount,
-               from: at(0, 1), to: at(Math.max(60, w), Math.max(20, Math.min(band - 2, SLICER_ITEM_PX + SLICER_PAD_PX))) };
+               from: at(0, 1), to: at(Math.max(60, w), Math.max(20, Math.min(band - ACTION_BAND_GAP_PX, heightPx))) };
     }).filter(Boolean));
 
     // native charts, once ExcelJS has written the file: pies and donuts get Tableau's pane cells inside the block
