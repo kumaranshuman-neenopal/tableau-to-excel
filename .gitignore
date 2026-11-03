@@ -1,3 +1,5 @@
 .claude/
 *.zip
 .vscode/
+*.twbx
+/*.twb

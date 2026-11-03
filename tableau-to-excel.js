@@ -8199,7 +8199,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-02 ef16705e";
+const EXTENSION_BUILD = "2026-11-03 bb641c14";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -10612,7 +10612,7 @@ function writeConversionReport(workbook, report) {
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
     "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
-    "Actions, highlighting and drill-down are interactive Tableau features and are not reproduced.",
+    "Filter actions (click a mark to filter) become a slicer of the clicked field above their source chart, filtering the sheets the action targets; hover actions, highlighting and drill-down are not reproduced.",
     "TABLE_FALLBACK means no Excel chart would show the visual correctly: its data is exported as a table instead (the cell carries a note)."
   ].forEach(t => { r++; put(r, 2, t, font, { alignment: { wrapText: true } }); ws.mergeCells(r, 2, r, 7); ws.getRow(r).height = 24; });
   return ws;
@@ -10698,7 +10698,7 @@ function writeConversionReports(workbook, reports) {
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
     "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
-    "Actions, highlighting and drill-down are interactive Tableau features and are not reproduced.",
+    "Filter actions (click a mark to filter) become a slicer of the clicked field above their source chart, filtering the sheets the action targets; hover actions, highlighting and drill-down are not reproduced.",
     "TABLE_FALLBACK means no Excel chart would show the visual correctly: its data is exported as a table instead (the cell carries a note)."
   ].forEach(t => { r++; put(r, 2, t, font, { alignment: { wrapText: true } }); ws.mergeCells(r, 2, r, 7); ws.getRow(r).height = 24; });
   return ws;
@@ -11942,14 +11942,19 @@ async function buildFilterCards(dashboard, sheets, fmtModel, layoutMap) {
   return cards;
 }
 
-/** the package with every worksheet's <sheetPr> in schema order and row groups in Excel's own form
- * (unchanged buffer when nothing moves) @param {ArrayBuffer | Uint8Array} buffer */
+/** a formula that filters an array (a distinct count: ROWS(UNIQUE(FILTER(…)))) as a single-cell array formula: Excel
+ * opens a plain one with implicit intersection, which cuts FILTER's condition to one value – #VALUE!, so 0
+ * @param {string} xml */
+const arrayFormulaCells = xml => xml.replace(/<c r="([A-Z]+\d+)"([^>]*)><f>(?=[^<]*_xlfn\._xlws\.FILTER\()/g, '<c r="$1"$2><f t="array" ref="$1">');
+
+/** the package with every worksheet's <sheetPr> in schema order, row groups in Excel's own form and FILTER formulas
+ * as array formulas (unchanged buffer when nothing moves) @param {ArrayBuffer | Uint8Array} buffer */
 async function fixSheetProperties(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   let changed = false;
   for (const name of Object.keys(zip.files).filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n))) {
     const xml = await zip.file(name).async("string");
-    const fixed = fixRowOutlines(orderSheetPr(xml));
+    const fixed = fixRowOutlines(orderSheetPr(arrayFormulaCells(xml)));
     if (fixed !== xml) { zip.file(name, fixed); changed = true; }
   }
   return changed ? zip.generateAsync({ type: "uint8array", compression: "DEFLATE" }) : buffer;
@@ -14123,7 +14128,15 @@ function slicerExcel(e, R, k) {
       case "MIN": return `_xlfn.MINIFS(${F},${on})`;
       case "MAX": return `_xlfn.MAXIFS(${F},${on})`;
       case "COUNT": return `COUNTIFS(${on},${F},"<>")`;
-      default: return `IFERROR(ROWS(_xlfn.UNIQUE(_xlfn._xlws.FILTER(${F},(${R.key}=${k})*(${R.vis}=1)*(${F}<>"")))),0)`;
+      default: {
+        // a distinct count: UNIQUE / FILTER (Excel 2021 / 365), else – #NAME? in Excel 2019 and older, or nothing left
+        // (#CALC!) – FREQUENCY of each kept row's first match, an array formula of every version (arrayFormulaCells)
+        // ponytail: MATCH over the whole column is O(rows²) in old Excel – a helper column if slicerMaxRows grows
+        const keyOk = /^"[<>]/.test(k) ? `(${R.key}${k.slice(1, -1)})` : `(${R.key}=${k})`;    // '">0"': any mark
+        const kept = `${keyOk}*(${R.vis}=1)*(${F}<>"")`;
+        return `IFERROR(ROWS(_xlfn.UNIQUE(_xlfn._xlws.FILTER(${F},${kept}))),` +
+               `SUM(--(FREQUENCY(IF(${kept},MATCH(${F},${F},0)),ROW(${F})-MIN(ROW(${F}))+1)>0)))`;
+      }
     }
   }
   return `(${slicerExcel(/** @type {SlicerExpr} */ (e.a), R, k)}${e.op}${slicerExcel(/** @type {SlicerExpr} */ (e.b), R, k)})`;
@@ -14310,9 +14323,11 @@ function createSlicerModel(names = { data: SLICER_DATA_SHEET, lists: SLICER_LIST
       const isDate = /date/.test(source.columns[col].dataType);
       if (deriv !== "none" && deriv !== "attr" && !isDate) return `"${ref.name}" holds no dates`;
       const d = deriv === "attr" ? "none" : deriv;
-      // a filter card of the same field already filters every visual (its slicer / dropdown): no second control
+      // a filter card of the same field already filters every visual (its slicer / dropdown): no second control –
+      // except over a pie or donut: its slices' slicer sits above it as on the other charts (ANDed with the card, as
+      // Tableau intersects an action filter with a quick filter)
       const card = fields.find(f => (f.kind === "slicer" || f.kind === "list") && f.srcCol === undefined && f.col === col && f.deriv === d);
-      if (card) return { covered: card.header };
+      if (card && !spec.pie) return { covered: card.header };
       const values = source.rows.map(r => slicerRowText(r[col], d, isDate) ?? "");
       const items = [...new Set(values)].filter(v => v !== "\u0000").sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
       if (!items.length || items.length > FORMAT_CONFIG.actionSlicerMaxItems) return `${items.length} values (an action slicer holds up to ${FORMAT_CONFIG.actionSlicerMaxItems})`;
@@ -15781,8 +15796,8 @@ async function exportToExcel() {
     /** @type {any} the XLSX bytes: ExcelJS's buffer, then injectCharts' Uint8Array */
     let buffer = await workbook.xlsx.writeBuffer();
     // fit-to-page next to collapsed row groups: ExcelJS writes <sheetPr> out of order – put it right
-    // and row groups in Excel's own form (else Excel asks to repair the file)
-    if (written.some(w => w.worksheet.properties.outlineProperties)) buffer = await fixSheetProperties(buffer);
+    // and row groups in Excel's own form (else Excel asks to repair the file); distinct counts as array formulas
+    if (written.some(w => w.worksheet.properties.outlineProperties || w.slicers)) buffer = await fixSheetProperties(buffer);
     // native charts, sheet by sheet: sized to their blocks now that the final column widths / row heights are known
     for (const w of written) {
       const jobs = w.finalizeCharts();
@@ -16349,7 +16364,8 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             let why = "no field of the rows";
             for (const ref of refs) {
               const info = tfFieldInfo(fmtModel, ref);
-              const field = await slicers.adoptAction({ ref, header: `${(info && info.caption) || ref.name} (${item.visualName || src})`, targets, source: src }, ws, fmtModel);
+              const field = await slicers.adoptAction({ ref, header: `${(info && info.caption) || ref.name} (${item.visualName || src})`, targets, source: src,
+                                                      pie: !!(item.visualModel && item.visualModel.pie) }, ws, fmtModel);
               if (typeof field === "string") { why = field; continue; }
               if (field.covered) { why = `the "${field.covered}" filter card filters by it already`; break; }
               actionSlicers.push({ field, source: src, caption: a.caption || `Filter by ${src}` });
@@ -17246,6 +17262,8 @@ setTableVisibleRows(placedItems);
                                          : it.slicer ? "Excel slicer (its selection as in Tableau)"
                                          : it.control ? controlOutput(it.control.field)
                                          : "Cells: the selected values" })),
+      ...actionSlicers.map(a => ({ name: a.caption, kind: "Filter action",
+                                   output: `Excel slicer above ${a.source}, filtering it and ${a.field.targets.size - 1} other sheet(s)` })),
       ...[...pieCentreSheets].map(name => ({ name, kind: "Worksheet in a donut's hole", output: "The donut's centre text" }))
     ];
     const report = {

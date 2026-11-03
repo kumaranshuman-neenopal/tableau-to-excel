@@ -40,19 +40,19 @@ test("Ecommerce Sales Overview: related tables joined, every visual follows, an 
   assert.match(log, /4 related tables joined on "order_items\.csv" – 10000 rows/);
   assert.equal(file.visuals.length, 8);
   assert.deepEqual(file.visuals.filter(v => !v.follows).map(v => v.worksheet), []);
-  // the pie's Channel and the scatter's Category: their filter cards' dropdowns do it
-  assert.match(log, /Channel \(Pie\)" not drawn: the "Channel" filter card filters by it already/);
+  // the scatter's Category: its filter card's dropdown does it; the pie gets its own above it, beside the Channel card
   assert.match(log, /\(Scatter\)" not drawn: the "Category" filter card filters by it already/);
-  assert.equal(Object.keys(file.zip.files).filter(n => /slicerCache\d+\.xml$/.test(n)).length, 6, "6 action slicers");
+  assert.match(log, /\[Actions\] "Channel \(Revenue Share by Channel \(Pie\)\)": 4 values of channel/);
+  assert.equal(Object.keys(file.zip.files).filter(n => /slicerCache\d+\.xml$/.test(n)).length, 7, "7 action slicers");
   assert.ok(file.sheets.includes("Slicer Actions"));
   // flat chips, moving and sizing with their rows – a row group the [–] hides, holding no cell of a chart or table
   const parts = await xmlParts(file.zip);
   const slicers = Object.entries(parts).filter(([n]) => /slicers\//.test(n)).map(([, x]) => x).join("");
-  assert.equal((slicers.match(/style="TfxChips"/g) || []).length, 6);
+  assert.equal((slicers.match(/style="TfxChips"/g) || []).length, 7);
   assert.match(parts["xl/styles.xml"], /<x14:slicerStyle name="TfxChips">/);
-  assert.equal((parts["xl/drawings/drawing1.xml"].match(/editAs="twoCell"/g) || []).length, 6);
+  assert.equal((parts["xl/drawings/drawing1.xml"].match(/editAs="twoCell"/g) || []).length, 7);
   const grouped = (parts["xl/worksheets/sheet1.xml"].match(/<row [^>]*outlineLevel="1"[^>]*>/g) || []);
-  assert.ok(grouped.length >= 6 && grouped.every(t => t.endsWith("/>")), "band rows grouped, empty");
+  assert.ok(grouped.length >= 7 && grouped.every(t => t.endsWith("/>")), "band rows grouped, empty");
 });
 
 test("Ecommerce exported at Channel = Website: the pie gets the other channels", { skip: skipEcom }, async () => {
@@ -78,12 +78,12 @@ test("Ecommerce Detail Analysis: the packed bubbles follow the slicers", { skip:
   assert.ok(bubbles && bubbles.follows, bubbles && bubbles.note);
 });
 
-test("Ecommerce, all four dashboards: a slicer table each, 9 action slicers", { skip: skipEcom }, async () => {
+test("Ecommerce, all four dashboards: a slicer table each, 11 action slicers", { skip: skipEcom }, async () => {
   const { file } = await exportOf(ECOM, "ALL", { REALCSV: "1" }, "all.xlsx");
   for (const s of ["KPI Overview", "Sales Overview", "Gauge & Donut", "Detail Analysis", "Slicer Data", "Slicer Data 2", "Slicer Data 3", "Slicer Data 4"])
     assert.ok(file.sheets.includes(s), `sheet ${s}`);
-  // 6 + 3 (Detail Analysis: Customer Region is a card) + 0 (Gauge & Donut: Device Type is a card)
-  assert.equal(Object.keys(file.zip.files).filter(n => /slicerCache\d+\.xml$/.test(n)).length, 9);
+  // 7 + 3 (Detail Analysis: Customer Region is a card) + 1 (Gauge & Donut: the donut's Device Type, beside its card)
+  assert.equal(Object.keys(file.zip.files).filter(n => /slicerCache\d+\.xml$/.test(n)).length, 11);
   // the chip style once, however many dashboards add it
   const styles = await file.zip.file("xl/styles.xml").async("string");
   assert.equal((styles.match(/<x14:slicerStyle name="TfxChips">/g) || []).length, 1);

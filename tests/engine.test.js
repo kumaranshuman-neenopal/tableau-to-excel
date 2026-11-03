@@ -32,7 +32,10 @@ test("calculations of aggregates: functions, conditions, parameters", () => {
     ["IFNULL(MAX([Sales]), 0)", 250, "IFERROR(_xlfn.MAXIFS(C0,K,1,V,1),0)"],
     ["MAX(SUM([Sales]), 500)", 500, "MAX(SUMIFS(C0,K,1,V,1),500)"],
     ["DIV(INT(SUM([Sales])), 7)", 44, null],
-    ["SUM([Sales]) / COUNT([Sales])", 310 / 3, null]
+    ["SUM([Sales]) / COUNT([Sales])", 310 / 3, null],
+    // UNIQUE / FILTER where Excel has them, else (Excel 2019: #NAME?) FREQUENCY of each kept row's first match
+    ["COUNTD([Sales])", 3, 'IFERROR(ROWS(_xlfn.UNIQUE(_xlfn._xlws.FILTER(C0,(K=1)*(V=1)*(C0<>"")))),' +
+                           'SUM(--(FREQUENCY(IF((K=1)*(V=1)*(C0<>""),MATCH(C0,C0,0)),ROW(C0)-MIN(ROW(C0))+1)>0)))']
   ];
   for (const [formula, value, excel] of cases) {
     const e = T.slicerParseCalc(src, model, formula, 0);

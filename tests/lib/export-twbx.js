@@ -182,10 +182,15 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
       ...JSON.parse(k).map((v, j) => { const raw = typeof v === "string" && /^\d{4}-\d\d-\d\dT/.test(v) ? new Date(v) : v; return raw instanceof Date ? { value: iso(raw), nativeValue: raw, formattedValue: iso(raw) } : raw === null ? { value: null, nativeValue: null, formattedValue: "Null" } : dv(raw); }),
       ...meas.map(x => {
         if (x.agg === "usr") { const v = T.slicerEval(x.e, idx.get(k), s.evalSrc || x.c.s.evalSrc, null); return v === null ? { value: null, nativeValue: null, formattedValue: "Null" } : dv(v); }
+        // a blended (secondary) data source's measure: this mock groups only the primary's rows
+        if (x.c.s !== s) return { value: null, nativeValue: null, formattedValue: "Null" };
         const vals = rows.map(r => r[x.c.i]).filter(v => v !== null && v !== undefined);
         const num = vals.map(Number);
+        // MIN / MAX of a string field: the first / last name, as Tableau gives it
+        const text = vals.some(v => typeof v === "string") ? vals.map(String).sort() : null;
         const v = x.agg === "sum" ? num.reduce((a, b) => a + b, 0) : x.agg === "avg" ? num.reduce((a, b) => a + b, 0) / num.length
-          : x.agg === "min" ? Math.min(...num) : x.agg === "max" ? Math.max(...num) : x.agg === "cnt" ? vals.length : new Set(vals.map(String)).size;
+          : x.agg === "min" ? (text ? text[0] : Math.min(...num)) : x.agg === "max" ? (text ? text[text.length - 1] : Math.max(...num))
+          : x.agg === "cnt" ? vals.length : new Set(vals.map(String)).size;
         return dv(v);
       })]);
     return { columns, data, totalRowCount: data.length };
