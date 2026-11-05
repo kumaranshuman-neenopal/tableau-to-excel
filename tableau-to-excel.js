@@ -4355,6 +4355,7 @@ function buildPieSpec(fmt, summary, opts = {}) {
     rowKeys: [...new Set(points.map(p => p.rowKey))], colKeys: [...new Set(points.map(p => p.colKey))],
     stretch: { w: axis("cols"), h: axis("rows") },             // a continuous axis (a donut's MIN(0)) → the pane fills the zone
     paneOf: r => keyOf(r, rowHdr) + "\u0001" + keyOf(r, colHdr),   // the pane of any summary row (e.g. a hole row)
+    measureRef: text => fmt.measureRefForName(text),            // a Measure Names member ("On-Time gauge | fill_r") → its field
     colorRef: enc ? enc.ref : null,
     font: pieFont(fmt.labelFont({})),
     /** @type {any} */ hole: null, /** @type {any} */ inner: null, /** @type {any} */ centerText: null
@@ -4591,27 +4592,38 @@ function writePieData(ds, startRow, pie, name) {
     const ref = writeRows(pts, pie);
     const innerPts = pie.inner ? pie.inner.points.filter(p => p.rowKey === rk && p.colKey === ck) : [];
     const innerRef = innerPts.length ? writeRows(innerPts, pie.inner) : null;
-    // a gauge the slicers filter out empties: its slices #N/A, its name and centre text blank (pie.gaugeShown)
-    const show = pie.gaugeShown && !innerPts.length ? pie.gaugeShown.show(pie.data[pts[0].row]) : null;
+    // a gauge the slicers filter out empties: its slices #N/A, its name and centre text blank (pie.gaugeShown); its
+    // slices recalculated from the rows they keep (gs.slices) move the needle, its labels' values with them (gs.part)
+    const gs = pie.gaugeShown;
+    const show = gs && !innerPts.length ? gs.show(pie.data[pts[0].row]) : null;
     if (show) {
       putRow(row, ["Gauge shown"]);
       ds.getCell(row, 2).value = { formula: `IF(ISNUMBER(${show}),1,NA())`, result: 1 };
       const on = `$B$${row++}`;
       const ifShown = text => ({ formula: `IF(ISNUMBER(${on}),${String(text).split("\n").map(xlText).join("&CHAR(10)&")},"")`, result: text });
+      /** label lines whose values follow (gs.part of the summary row's measures), else Tableau's text while shown */
+      const liveText = (lp, r, text) => {
+        const lines = lp ? labelLineFormulas(lp, part => (part.col >= 0 ? gs.part(r, part.col, "cell") : null)) : [];
+        return lines.some(l => l.dynamic)
+          ? { formula: `IF(ISNUMBER(${on}),${lines.map(l => l.expr).join("&CHAR(10)&")},"")`, result: text } : ifShown(text);
+      };
       const labels = pts.map((p, i) => {
-        if (typeof p.value === "number") ds.getCell(`${valCol}${first + i}`).value = { formula: `${p.value}*${on}`, result: p.value };
+        const f = gs.slices && gs.part(pie.data[p.row], pie.valueCol, "chart");
+        if (typeof p.value === "number") ds.getCell(`${valCol}${first + i}`).value = { formula: f || `${p.value}*${on}`, result: p.value };
         if (!p.label) return null;
-        ds.getCell(`${lblCol}${first + i}`).value = ifShown(plainText(p.label));
+        ds.getCell(`${lblCol}${first + i}`).value = liveText(p.labelParts, pie.data[p.row], plainText(p.label));
         return sheetRef(ds.name, `$${lblCol}$${first + i}`);
       });
-      pie.gaugeShown.binding.written += pts.length;
-      const lines = (single && pie.centerText && pie.centerText.lines) || (pie.hole && pie.hole.labelFor(pts)) || [];
+      gs.binding.written += pts.length;
+      const floating = single && pie.centerText && pie.centerText.lines;
+      const lines = floating || (pie.hole && pie.hole.labelFor(pts)) || [];
+      const lp = !floating && pie.hole ? pie.hole.labelPartsFor(pts) : null;
       let centre = null;
       if (lines.length) {
         putRow(row, ["Centre text"]);
         centre = lines.map((l, i) => {
           const cell = ds.getCell(row, i + 2);
-          cell.value = ifShown(plainText([l]));
+          cell.value = liveText(lp && lp.lines[i] ? { ...lp, lines: [lp.lines[i]] } : null, pie.data[pts[0].row], plainText([l]));
           return sheetRef(ds.name, `$${cell.address.replace(/\d+$/, "")}$${row}`);
         });
         row++;
@@ -8208,7 +8220,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-05 69a65116";
+const EXTENSION_BUILD = "2026-11-05 dc773f8e";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -14921,36 +14933,60 @@ function bindPie(slicers, pie, sheetName, filters, model) {
 }
 
 /**
- * A pie gauge (pie.gauge) follows the slicers as a whole: its slices are Tableau's own numbers (calculations on
- * Measure Names: colored>50%, Needle limit …), but each gauge – one per pane (mitra / product) – is shown while its
- * marks pass the slicers and empty when they filter it out. Binds one mark per pane on a measure of the sheet the
- * data source's rows give (SUM(Gauge Value)), Measure Names / Values left out.
- * @returns {{ binding: any, show: (row: any[]) => string | null } | string} or the reason it keeps fixed values
+ * A pie gauge (pie.gauge) bound to the slicers, one mark per pane (a gauge each: mitra / product, a region). Each
+ * pane's summary rows become one: its dimensions, then every measure it shows – a Measure Names member (a slice's
+ * Measure Values: fill_r, track_r …) a column of its own, as is a measure of the hole's own row (AGG(On-Time %)).
+ * The slicers' check against Tableau's numbers decides how far it follows:
+ * - every slice's calculation rebuilt from the data source's rows (slices): its slices and their labels are formulas
+ *   (part), so the needle moves with the slicers – as do labels of the pane's other measures (the hole's text);
+ * - else the slices keep Tableau's numbers (colored>50%, Needle limit …) and the gauge only shows, or empties, as
+ *   the slicers keep or filter out its marks (show: on a measure the rows give, SUM(Gauge Value)).
+ * @returns {{ binding: any, show: (row: any[]) => string | null, slices: boolean,
+ *             part: (row: any[], col: number, mode: string) => string | null } | string} or why it keeps fixed values
  */
 function bindGaugeShown(slicers, pie, sheetName, filters, model) {
-  const reps = [];
-  const seen = new Set();
-  pie.points.forEach(p => { const key = p.rowKey + "\u0001" + p.colKey; if (!seen.has(key)) { seen.add(key); reps.push(pie.data[p.row]); } });
+  const named = re => pie.columns.findIndex(c => re.test(String(c.name)));
+  const mn = named(/^Measure Names$/i), mv = named(/^Measure Values$/i);
+  // each pane's rows (its slices', its hole's), the first slice row standing for its dimensions
+  const panes = new Map();
+  pie.points.forEach(p => { const k = p.rowKey + "\u0001" + p.colKey; if (!panes.has(k)) panes.set(k, { rep: pie.data[p.row], rows: [] }); });
+  pie.data.forEach(r => { const g = panes.get(pie.paneOf(r)); if (g) g.rows.push(r); });
+  const groups = [...panes.values()];
   // a dimension the same on every gauge does not tell them apart: left out (a constant colour calculation such as
   // 'dummy', which Tableau's summary data may even leave empty)
-  const constant = k => !pie.columns[k].numeric && new Set(reps.map(r => tfDvText(r[k]))).size === 1;
-  const keep = pie.columns.map((c, k) => k).filter(k => k !== pie.valueCol && !constant(k) &&
-                                                       !/^Measure (Names|Values)$/i.test(String(pie.columns[k].name)));
-  const project = r => keep.map(k => r[k]);
+  const constant = k => !pie.columns[k].numeric && new Set(groups.map(g => tfDvText(g.rep[k]))).size === 1;
+  const isMeasure = k => { const c = pie.columns[k], d = String((c.ref && c.ref.deriv) || "").toLowerCase(); return c.numeric || !!SLICER_AGGS[d] || d === "usr"; };
+  // a measure is the pane's when its rows agree on it (an axis' 0, the hole's value); one that differs slice by slice is not
+  const paneValue = (g, k) => { const v = [...new Set(g.rows.filter(r => !tfIsNull(r[k])).map(r => tfDvText(r[k])))]; return v.length > 1 ? undefined : g.rows.find(r => !tfIsNull(r[k])) || null; };
+  const keep = pie.columns.map((c, k) => k).filter(k => k !== pie.valueCol && k !== mn && k !== mv && !constant(k) &&
+                                                       (!isMeasure(k) || groups.every(g => paneValue(g, k) !== undefined)));
+  // the slices' members: Measure Values on the angle, a member a measure of its own
+  const members = mn >= 0 && pie.valueCol === mv
+    ? [...new Set(pie.points.map(p => tfDvText(pie.data[p.row][mn])))].map(text => ({ text, ref: pie.measureRef(text) })) : [];
+  const NUL = { value: null, nativeValue: null, formattedValue: "Null" };
   const vm = /** @type {any} */ ({
-    cols: keep.map(k => {
-      const c = pie.columns[k], d = String((c.ref && c.ref.deriv) || "").toLowerCase();
-      return { name: c.name, label: c.name, ref: c.ref, isHeader: !c.numeric && !(SLICER_AGGS[d] || d === "usr") };
-    }),
-    rows: reps.map(project), order: [], matrix: null
+    cols: [...keep.map(k => ({ name: pie.columns[k].name, label: pie.columns[k].name, ref: pie.columns[k].ref, isHeader: !isMeasure(k) })),
+           ...members.filter(m => m.ref).map(m => ({ name: m.text, label: m.text, ref: m.ref, isHeader: false }))],
+    rows: groups.map(g => [...keep.map(k => (isMeasure(k) ? (paneValue(g, k) || {})[k] || NUL : g.rep[k])),
+                           ...members.filter(m => m.ref).map(m => { const r = g.rows.find(x => tfDvText(x[mn]) === m.text); return r ? r[mv] : NUL; })]),
+    order: [], matrix: null
   });
   vm.order = vm.cols.map((c, ci) => ci).filter(ci => !vm.cols[ci].isHeader);
   const binding = slicers.bind(vm, sheetName, filters, model);
   if (typeof binding === "string") return binding;
-  // a measure with numbers of its own: a constant 0 (SUM(0)) would match Tableau's even with no rows behind a gauge
+  const rowOf = new Map([...panes.keys()].map((k, i) => [k, vm.rows[i]]));
+  const at = (row, ci, mode) => { const pr = rowOf.get(pie.paneOf(row)); return pr && ci >= 0 ? binding.formulaFor([pr], ci, mode) : null; };
+  const memberCi = row => keep.length + members.filter(m => m.ref).findIndex(m => m.text === tfDvText(row[mn]));
+  // the slices follow only all together: a gauge drawn from some new and some old numbers would point nowhere
+  const slices = members.length > 0 && members.every(m => m.ref) &&
+    pie.points.every(p => at(pie.data[p.row], memberCi(pie.data[p.row]), "chart"));
+  /** the formula of a summary row's measure in column col (a slice's value: its member's) – null: it stays fixed */
+  const part = (row, col, mode) => col === pie.valueCol ? (slices ? at(row, memberCi(row), mode) : null)
+    : keep.includes(col) && isMeasure(col) ? at(row, keep.indexOf(col), mode) : null;
+  // shown: a measure with numbers of its own – a constant 0 (SUM(0)) would match Tableau's even with no rows behind it
   const ci = vm.order.find(i => vm.rows.some(r => tfDvNum(r[i])) && vm.rows.every(r => binding.formulaFor([r], i, "chart")));
   if (ci === undefined) return binding.reasons[0] || "no measure of the gauge can be rebuilt from the data source's rows";
-  return { binding, show: row => binding.formulaFor([project(row)], ci, "chart") };
+  return { binding, slices, part, show: row => at(row, ci, "chart") };
 }
 
 const DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -16388,7 +16424,9 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         for (const item of dataWorksheetItems) {
           const vmod = item.visualModel;
           const pie = vmod && vmod.pie;
-          if (item.vm && pie && pie.gauge && !pie.inner && !vmod.gauge && vmod.renderer !== "tableau-image") {
+          // a gauge – or a pie whose slices are Measure Values (a progress ring's fill / track): one mark per pane
+          const measureSlices = pie && pie.valueCol >= 0 && /^Measure Values$/i.test(String(pie.columns[pie.valueCol].name));
+          if (item.vm && pie && (pie.gauge || measureSlices) && !pie.inner && !vmod.gauge && vmod.renderer !== "tableau-image") {
             const sheet = sheets.find(s => s.name === item.name);
             let filters = [];
             try { filters = sheet && typeof sheet.getFiltersAsync === "function" ? (await sheet.getFiltersAsync()) || [] : []; }
@@ -16398,7 +16436,8 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             else {
               item.vm.slicerBinding = shown.binding;
               pie.gaugeShown = shown;
-              item.slicerNote = "follows the slicers: each gauge shows, or empties, as they keep or filter out its marks (its slices keep Tableau's numbers)";
+              item.slicerNote = shown.slices ? "follows the slicers: each gauge's slices and labels are recalculated from the rows they keep"
+                : "follows the slicers: each gauge shows, or empties, as they keep or filter out its marks (its slices keep Tableau's numbers)";
             }
             continue;
           }

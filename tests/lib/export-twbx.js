@@ -142,22 +142,31 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
     if (!sh) return { columns: [], data: [] };
     const refs = [...(sh.rows || []), ...(sh.cols || []), ...(sh.panes || []).flatMap(p => p.encodings.map(e => e.field))].filter(Boolean);
     const dims = [], meas = [], seen = new Set();
-    refs.forEach(r => {
-      if (seen.has(r.inner)) return; seen.add(r.inner);
+    /** a measure: an aggregate of a column, or a calculation evaluated on the rows (null: neither) */
+    const measOf = r => {
       const c = colOf(r), d = String(r.deriv || "none").toLowerCase();
       if (!c && d === "usr") {
         const info = T.tfFieldInfo(model, r), s0 = sources[r.ds];
-        if (!info || !info.formula || !s0) return;
+        if (!info || !info.formula || !s0) return null;
         const cell = v => v === null || v === undefined ? { value: null, nativeValue: null, formattedValue: "Null" } : v instanceof Date ? { value: iso(v), nativeValue: v, formattedValue: iso(v) } : dv(v);
         s0.evalSrc = s0.evalSrc || { id: s0.id, name: s0.id, columns: s0.cols.map(k => ({ name: k.caption, dataType: k.type })), rows: s0.rows.map(row => row.map(cell)) };
         const e = T.slicerParseCalc(s0.evalSrc, model, info.formulaFull || info.formula, 0);
-        if (e) meas.push({ r, c: { s: s0 }, agg: "usr", e });
-        return;
+        return e ? { r, c: { s: s0 }, agg: "usr", e } : null;
       }
-      if (!c) return;
-      if (AGG[d]) meas.push({ r, c, agg: d });
-      else if (d === "none" || d === "attr" || /^(yr|qr|mn|dy|wd|wk|tyr|tqr|tmn|twk|tdy)$/.test(d)) dims.push({ r, c, d });
+      return c && AGG[d] ? { r, c, agg: d } : null;
+    };
+    refs.forEach(r => {
+      if (seen.has(r.inner)) return; seen.add(r.inner);
+      const c = colOf(r), d = String(r.deriv || "none").toLowerCase();
+      const m = measOf(r);
+      if (m) meas.push(m);
+      else if (c && (d === "none" || d === "attr" || /^(yr|qr|mn|dy|wd|wk|tyr|tqr|tmn|twk|tdy)$/.test(d))) dims.push({ r, c, d });
     });
+    // Measure Names on the view: Tableau gives a row per member of its Measure Names filter (Measure Values: that
+    // member's value, the axis measures beside it), then a row of the sheet's other measures
+    const members = refs.some(r => /^Measure Names$/i.test(r.name))
+      ? (sh.measureFilter || []).map(m => T.tfParseFieldRef(String(m).replace(/^"|"$/g, ""))).map(r => r && measOf(r)).filter(Boolean) : [];
+    const axis = new Set([...(sh.rows || []), ...(sh.cols || [])].filter(Boolean).map(r => r.inner));
     if (!dims.length && !meas.length) return { columns: [], data: [] };
     const s = (dims[0] || meas[0]).c.s;
     const groups = new Map(), idx = new Map();
@@ -175,24 +184,32 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
       (groups.get(k) || groups.set(k, []).get(k)).push(row);
       (idx.get(k) || idx.set(k, []).get(k)).push(ri);
     });
+    const NUL = { value: null, nativeValue: null, formattedValue: "Null" };
     const columns = [...dims.map(x => ({ fieldName: caption(x.r), fieldId: `[${x.r.ds}].[${x.r.inner}]`, dataType: x.c.c.type })),
-                     ...meas.map(x => ({ fieldName: `${x.agg === "usr" ? "AGG" : AGG[x.agg]}(${caption(x.r)})`, fieldId: `[${x.r.ds}].[${x.r.inner}]`, dataType: "float" }))]
+                     ...(members.length ? [{ fieldName: "Measure Names", fieldId: "[:Measure Names]", dataType: "string" }] : []),
+                     ...meas.map(x => ({ fieldName: `${x.agg === "usr" ? "AGG" : AGG[x.agg]}(${caption(x.r)})`, fieldId: `[${x.r.ds}].[${x.r.inner}]`, dataType: "float" })),
+                     ...(members.length ? [{ fieldName: "Measure Values", fieldId: "[Multiple Values]", dataType: "float" }] : [])]
       .map((c, i) => ({ ...c, index: i }));
-    const data = [...groups.entries()].map(([k, rows]) => [
-      ...JSON.parse(k).map((v, j) => { const raw = typeof v === "string" && /^\d{4}-\d\d-\d\dT/.test(v) ? new Date(v) : v; return raw instanceof Date ? { value: iso(raw), nativeValue: raw, formattedValue: iso(raw) } : raw === null ? { value: null, nativeValue: null, formattedValue: "Null" } : dv(raw); }),
-      ...meas.map(x => {
-        if (x.agg === "usr") { const v = T.slicerEval(x.e, idx.get(k), s.evalSrc || x.c.s.evalSrc, null); return v === null ? { value: null, nativeValue: null, formattedValue: "Null" } : dv(v); }
-        // a blended (secondary) data source's measure: this mock groups only the primary's rows
-        if (x.c.s !== s) return { value: null, nativeValue: null, formattedValue: "Null" };
-        const vals = rows.map(r => r[x.c.i]).filter(v => v !== null && v !== undefined);
-        const num = vals.map(Number);
-        // MIN / MAX of a string field: the first / last name, as Tableau gives it
-        const text = vals.some(v => typeof v === "string") ? vals.map(String).sort() : null;
-        const v = x.agg === "sum" ? num.reduce((a, b) => a + b, 0) : x.agg === "avg" ? num.reduce((a, b) => a + b, 0) / num.length
-          : x.agg === "min" ? (text ? text[0] : Math.min(...num)) : x.agg === "max" ? (text ? text[text.length - 1] : Math.max(...num))
-          : x.agg === "cnt" ? vals.length : new Set(vals.map(String)).size;
-        return dv(v);
-      })]);
+    const valueOf = (x, k, rows) => {
+      if (x.agg === "usr") { const v = T.slicerEval(x.e, idx.get(k), s.evalSrc || x.c.s.evalSrc, null); return v === null ? NUL : dv(v); }
+      // a blended (secondary) data source's measure: this mock groups only the primary's rows
+      if (x.c.s !== s) return NUL;
+      const vals = rows.map(r => r[x.c.i]).filter(v => v !== null && v !== undefined);
+      const num = vals.map(Number);
+      // MIN / MAX of a string field: the first / last name, as Tableau gives it
+      const text = vals.some(v => typeof v === "string") ? vals.map(String).sort() : null;
+      const v = x.agg === "sum" ? num.reduce((a, b) => a + b, 0) : x.agg === "avg" ? num.reduce((a, b) => a + b, 0) / num.length
+        : x.agg === "min" ? (text ? text[0] : Math.min(...num)) : x.agg === "max" ? (text ? text[text.length - 1] : Math.max(...num))
+        : x.agg === "cnt" ? vals.length : new Set(vals.map(String)).size;
+      return dv(v);
+    };
+    const data = [...groups.entries()].flatMap(([k, rows]) => {
+      const head = JSON.parse(k).map(v => { const raw = typeof v === "string" && /^\d{4}-\d\d-\d\dT/.test(v) ? new Date(v) : v; return raw instanceof Date ? { value: iso(raw), nativeValue: raw, formattedValue: iso(raw) } : raw === null ? NUL : dv(raw); });
+      const values = meas.map(x => valueOf(x, k, rows));
+      if (!members.length) return [[...head, ...values]];
+      return [...members.map(m => [...head, dv(caption(m.r)), ...meas.map((x, j) => (axis.has(x.r.inner) ? values[j] : NUL)), valueOf(m, k, rows)]),
+              [...head, NUL, ...values, NUL]];
+    });
     return { columns, data, totalRowCount: data.length };
   };
 

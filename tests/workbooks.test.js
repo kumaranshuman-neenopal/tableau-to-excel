@@ -19,6 +19,8 @@ const has = f => !!DIR && fs.existsSync(f);
 const EXCEL = process.env.TFX_EXCEL === "1" && process.platform === "win32";
 const skipEcom = has(ECOM) ? false : "TFX_WORKBOOKS has no Ecommerce_Dashboard.twbx";
 const skipLogi = has(LOGI) ? false : "TFX_WORKBOOKS has no Untitled_17.twbx";
+const GAUGE = path.join(DIR, "Gauge Charts.twbx");
+const skipGauge = has(GAUGE) ? false : "TFX_WORKBOOKS has no Gauge Charts.twbx";
 
 /** the workbook exported (one dashboard, or ALL) → { log, file } */
 async function exportOf(twbx, dashboard, env, name) {
@@ -53,6 +55,16 @@ test("Ecommerce Sales Overview: related tables joined, every visual follows, an 
   assert.equal((parts["xl/drawings/drawing1.xml"].match(/editAs="twoCell"/g) || []).length, 7);
   const grouped = (parts["xl/worksheets/sheet1.xml"].match(/<row [^>]*outlineLevel="1"[^>]*>/g) || []);
   assert.ok(grouped.length >= 7 && grouped.every(t => t.endsWith("/>")), "band rows grouped, empty");
+});
+
+test("Gauge Charts: gauges whose slices are Measure Values calculations recalculate with the slicers", { skip: skipGauge }, async () => {
+  const { log, file } = await exportOf(GAUGE, "Gauge Chart Gallery", { REALCSV: "1" }, "gauges.xlsx");
+  for (const s of ["Semi-Circle Gauge", "RAG Threshold Gauge", "Speedometer Needle Gauge", "270 Degree Arc Gauge", "Donut Progress Ring"])
+    assert.match(log, new RegExp(`\\[Slicers\\] ${s}: follows the slicers \\(1 marks`), s);
+  assert.match(log, /\[Slicers\] Gauge Small Multiples by Region: follows the slicers \(4 marks/);
+  // a slice: its member's calculation over the rows the slicers keep (fill_r = MAX(MIN(1, MAX(0, on-time %)), 0.5) - 0.5)
+  const data = (await xmlParts(file.zip))[`xl/worksheets/sheet${file.sheets.indexOf("Chart Data") + 1}.xml`];
+  assert.ok(/<f>IF\(COUNTIFS\([^<]*MAX\(MIN\(1,MAX\(0,/.test(data.replace(/&apos;/g, "'")), "slice formulas");
 });
 
 test("Ecommerce exported at Channel = Website: the pie gets the other channels", { skip: skipEcom }, async () => {
