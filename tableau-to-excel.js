@@ -5104,7 +5104,102 @@ function tfCalcContext(model, summary, cols) {
     };
     return env;
   };
-  return { forRow, colFor, fieldInfo, formulaOf, paramInfo };
+  /**
+   * A field of one summary row as an Excel formula: a parameter with a cell (paramCell(info) → "'Dash'!$B$4") is that
+   * cell, a calculation that uses one is translated, anything else is the value forRow gives (a constant). A
+   * condition that is constant picks its branch (CASE [level] WHEN 1 …: only that row's arm). Returns { c: value },
+   * { x: formula } or, for MAKEPOINT, { pt: { x, y } } of those; throws TfCalcError for what it cannot write.
+   * @param {any[] | null} row @param {string} dsHint @param {(info: any) => string | null} paramCell
+   */
+  const excelField = (row, dsHint, paramCell, parts) => {
+    const xl = (n, ds) => {
+      const env = forRow(row, ds);
+      const kids = list => list.map(a => xl(a, ds));
+      const fold = (vals, f) => (vals.every(v => "c" in v) ? { c: tfCalcEval(n, env) } : { x: f(vals.map(tfExcelOf)) });
+      switch (n.k) {
+        case "lit": return { c: n.v };
+        case "field": return field(n.parts, ds);
+        case "lod": return xl(n.a, ds);
+        case "neg": return fold(kids([n.a]), ([a]) => `-(${a})`);
+        case "not": return fold(kids([n.a]), ([a]) => `NOT(${a})`);
+        case "and": case "or": return fold(kids([n.l, n.r]), ([a, b]) => `${n.k.toUpperCase()}(${a},${b})`);
+        case "in": return fold(kids([n.a, ...n.list]), ([a, ...l]) => `OR(${l.map(v => `${a}=${v}`).join(",")})`);
+        case "bin": {
+          const XL = { "%": ([a, b]) => `MOD(${a},${b})`, "^": ([a, b]) => `POWER(${a},${b})` };
+          return fold(kids([n.l, n.r]), XL[n.op] || (([a, b]) => `(${a}${n.op}${b})`));
+        }
+        case "if": {
+          for (let i = 0; i < n.arms.length; i++) {
+            const c = xl(n.arms[i][0], ds);
+            if ("c" in c && c.c !== true) continue;            // constant false / null: the next arm
+            if ("c" in c) return xl(n.arms[i][1], ds);
+            const rest = { k: "if", arms: n.arms.slice(i + 1), other: n.other };
+            return { x: `IF(${tfExcelOf(c)},${tfExcelOf(xl(n.arms[i][1], ds))},${tfExcelOf(rest.arms.length ? xl(rest, ds) : xl(n.other, ds))})` };
+          }
+          return xl(n.other, ds);
+        }
+        case "case": {
+          const s = xl(n.subject, ds);
+          const arms = n.arms.map(([m, v]) => ({ vals: m.inList || m.vals, v }));
+          if ("c" in s) {                                        // a row's own value: its arm only
+            const hit = arms.find(a => a.vals.some(x => { const y = xl(x, ds); return "c" in y && y.c === s.c; }));
+            return hit ? xl(hit.v, ds) : xl(n.other, ds);
+          }
+          const S = tfExcelOf(s);
+          return { x: arms.reduceRight((acc, a) => `IF(OR(${a.vals.map(x => `${S}=${tfExcelOf(xl(x, ds))}`).join(",")}),${tfExcelOf(xl(a.v, ds))},${acc})`, tfExcelOf(xl(n.other, ds))) };
+        }
+        case "call": {
+          const f = n.f, a = n.args;
+          if (f === "MAKEPOINT") return { pt: { x: xl(a[1], ds), y: xl(a[0], ds) } };      // x = longitude, y = latitude
+          if (f === "IIF") return xl({ k: "if", arms: [[a[0], a[1]]], other: a[2] || { k: "lit", v: null } }, ds);
+          if (TF_CALC_AGG.has(f) && a.length === 1) return xl(a[0], ds);                   // one mark: its value
+          const XL = {
+            IFNULL: v => `IFERROR(${v[0]},${v[1]})`, ZN: v => `IFERROR(${v[0]},0)`, MIN: v => `MIN(${v})`, MAX: v => `MAX(${v})`,
+            PI: () => "PI()", SIN: v => `SIN(${v[0]})`, COS: v => `COS(${v[0]})`, TAN: v => `TAN(${v[0]})`, ASIN: v => `ASIN(${v[0]})`,
+            ACOS: v => `ACOS(${v[0]})`, ATAN: v => `ATAN(${v[0]})`, ATAN2: v => `ATAN2(${v[1]},${v[0]})`,     // Excel: x first
+            SQRT: v => `SQRT(${v[0]})`, ABS: v => `ABS(${v[0]})`, EXP: v => `EXP(${v[0]})`, LN: v => `LN(${v[0]})`,
+            SIGN: v => `SIGN(${v[0]})`, FLOOR: v => `INT(${v[0]})`, CEILING: v => `-INT(-(${v[0]}))`, INT: v => `TRUNC(${v[0]})`,
+            FLOAT: v => v[0], SQUARE: v => `POWER(${v[0]},2)`, RADIANS: v => `RADIANS(${v[0]})`, DEGREES: v => `DEGREES(${v[0]})`,
+            POWER: v => `POWER(${v[0]},${v[1]})`, LOG: v => (v[1] ? `LOG(${v[0]},${v[1]})` : `LOG10(${v[0]})`),
+            ROUND: v => `ROUND(${v[0]},${v[1] || 0})`, DIV: v => `TRUNC(${v[0]}/${v[1]})`
+          };
+          const vals = kids(a);
+          if (vals.every(v => "c" in v)) return { c: tfCalcEval(n, env) };
+          if (!XL[f]) throw new TfCalcError(`function ${f} has no Excel formula`);
+          return { x: XL[f](vals.map(tfExcelOf)) };
+        }
+        default: throw new TfCalcError("unknown expression");
+      }
+    };
+    const field = (fparts, ds) => {
+      const name = fparts[fparts.length - 1];
+      const fds = fparts.length > 1 ? fparts[0] : ds;
+      if (/^parameters$/i.test(fds) || (!fds && paramInfo(name) && !fieldInfo(name))) {
+        const cell = paramCell(paramInfo(name));
+        return cell ? { x: cell } : { c: forRow(row, ds).field(fparts) };
+      }
+      const info = fieldInfo(name, fds), formula = formulaOf(info);
+      const r = formula ? xl(astOf((info.ds || fds) + "|" + name, formula), info.ds || fds) : null;
+      return r && !("c" in r) ? r : { c: forRow(row, ds).field(fparts) };   // constant: the row's own value wins
+    };
+    return field(parts, dsHint);
+  };
+  return { forRow, colFor, fieldInfo, formulaOf, paramInfo, excelField };
+}
+
+/** a translated value ({ c } / { x }, excelField) as formula text */
+function tfExcelOf(v) {
+  if (!("c" in v)) { if (v.x === undefined) throw new TfCalcError("a point is not a number"); return v.x; }
+  const c = v.c;
+  if (c === null || c === undefined) return "NA()";
+  if (typeof c === "boolean") return c ? "TRUE" : "FALSE";
+  if (typeof c === "number") {
+    if (!isFinite(c)) throw new TfCalcError("not a finite number");
+    const s = String(c);                                       // no exponent: 1e-17 → 0.00000000000000001
+    return /e/i.test(s) && Math.abs(c) < 1 ? c.toFixed(20).replace(/\.?0+$/, "") : s;
+  }
+  if (typeof c === "string") return `"${c.replace(/"/g, '""')}"`;
+  throw new TfCalcError("not a value");
 }
 
 /* ── geometry ───────────────────────────────────────────────────────────── */
@@ -5192,20 +5287,22 @@ function tfFitDialCentre(pts, paths) {
 /** degrees clockwise from 12 o'clock of (x, y) around the centre */
 const tfGaugeAngle = (x, y, c) => Math.atan2(x - c.cx, y - c.cy) * 180 / Math.PI;
 
-/** a polygon's angular range [from, to] (degrees clockwise from 12), unwrapped along its outline */
+/** a polygon's angular range [from, to] (degrees clockwise from 12), unwrapped along its outline; fromAt / toAt:
+ * the points at its two ends */
 function tfAngularRange(pts, c) {
-  let prev = null, off = 0, lo = Infinity, hi = -Infinity;
-  for (const [x, y] of pts) {
-    if (Math.hypot(x - c.cx, y - c.cy) < 1e-9) continue;     // the centre itself has no angle
+  let prev = null, off = 0, lo = Infinity, hi = -Infinity, fromAt = -1, toAt = -1;
+  pts.forEach(([x, y], i) => {
+    if (Math.hypot(x - c.cx, y - c.cy) < 1e-9) return;       // the centre itself has no angle
     let a = tfGaugeAngle(x, y, c) + off;
     if (prev !== null) {
       while (a - prev > 180) { a -= 360; off -= 360; }
       while (a - prev < -180) { a += 360; off += 360; }
     }
     prev = a;
-    lo = Math.min(lo, a); hi = Math.max(hi, a);
-  }
-  return isFinite(lo) ? { from: lo, to: hi } : null;
+    if (a < lo) { lo = a; fromAt = i; }
+    if (a > hi) { hi = a; toAt = i; }
+  });
+  return isFinite(lo) ? { from: lo, to: hi, fromAt, toAt } : null;
 }
 
 /** Tableau's "Automatic" number format: thousands separators; whole numbers from 1,000 up, else up to 2 decimals */
@@ -5270,6 +5367,7 @@ function buildMapGaugeModel(model, sheetName, summary) {
         }
         if (xy && xy.every(isFinite)) out.push({ row, ri, xy });
       });
+      out.loc = spatial ? { spatial } : { xy: xyRefs };       // how a mark's position is computed (live)
       return out;
     };
 
@@ -5297,7 +5395,7 @@ function buildMapGaugeModel(model, sheetName, summary) {
         if (pi >= 0) g.marks.sort((a, b) => (tfDvNum(a.row[pi]) || 0) - (tfDvNum(b.row[pi]) || 0));
         const argb = scale ? scale(vals[k]) : null;
         shapes.push({ pts: g.marks.map(m => m.xy), color: (argb ? argb.slice(2) : pfmt.markColor()).toUpperCase(),
-                      name: ci >= 0 ? tfDvText(g.marks[0].row[ci]) : "", first: g.first });
+                      name: ci >= 0 ? tfDvText(g.marks[0].row[ci]) : "", first: g.first, marks: g.marks, loc: marks.loc });
       });
     }
     shapes.sort((a, b) => a.first - b.first);                 // Tableau draws in summary order: later on top
@@ -5341,8 +5439,10 @@ function buildMapGaugeModel(model, sheetName, summary) {
     ranges.forEach(s => {
       const mid = (s.range.from + s.range.to) / 2;
       const k = Math.round((ref - mid) / 360);
-      s.range = { from: s.range.from + 360 * k, to: s.range.to + 360 * k };
+      s.range = { ...s.range, from: s.range.from + 360 * k, to: s.range.to + 360 * k };
     });
+    // an arc's end: the mark there, its position's calculation and its angle in this frame (live)
+    const endOf = (s, end) => ({ mark: s.marks[s.range[end + "At"]], loc: s.loc, angle: s.range[end] });
     const start = Math.min(...ranges.map(s => s.range.from)), end = Math.max(...ranges.map(s => s.range.to));
     const span = Math.min(360, end - start);
     if (span < 30) return no("the arcs span under 30°");
@@ -5358,10 +5458,12 @@ function buildMapGaugeModel(model, sheetName, summary) {
       else bands.push({ from: a - STEP / 2, to: a + STEP / 2, color, name });
     }
     // snap band edges to the arcs' own end angles (the sampling is only 0.25° fine)
-    const edges = ranges.flatMap(s => [s.range.from, s.range.to]);
+    const edges = ranges.flatMap(s => [{ a: s.range.from, end: endOf(s, "from") }, { a: s.range.to, end: endOf(s, "to") }]);
     bands.forEach(b => {
-      const snap = v => { const e = edges.find(x => Math.abs(x - v) <= STEP); return e === undefined ? v : e; };
-      b.from = snap(b.from); b.to = snap(b.to);
+      const snap = v => edges.find(x => Math.abs(x.a - v) <= STEP);
+      const f = snap(b.from), t = snap(b.to);
+      if (f) { b.from = f.a; b.fromEnd = f.end; }
+      if (t) { b.to = t.a; b.toEnd = t.end; }
     });
 
     // the other layers: a needle (a line from the centre outwards) and text
@@ -5374,7 +5476,8 @@ function buildMapGaugeModel(model, sheetName, summary) {
     if (needleShape) {
       const d = needleShape.pts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy)), far = Math.max(...d);
       const tip = needleShape.pts[d.indexOf(far)];
-      needle = { angle: wrap(tfGaugeAngle(tip[0], tip[1], c)), length: far / R, color: needleShape.color };
+      const angle = wrap(tfGaugeAngle(tip[0], tip[1], c));
+      needle = { angle, length: far / R, color: needleShape.color, end: { mark: needleShape.marks[d.indexOf(far)], loc: needleShape.loc, angle } };
     }
     const hubShape = shapes.find(sh => sh.role === "hub");
     if (hubShape) hub = { color: hubShape.color, ratio: Math.max(...hubShape.pts.map(([x, y]) => Math.hypot(x - c.cx, y - c.cy))) / R };
@@ -5392,7 +5495,8 @@ function buildMapGaugeModel(model, sheetName, summary) {
         const near = Math.min(...d), far = Math.max(...d);
         if (near < 0.2 && far > 0.4 && (!needle || far > needle.length)) {
           const tip = marks[d.indexOf(far)];
-          needle = { angle: wrap(tfGaugeAngle(tip.xy[0], tip.xy[1], c)), length: far, color: pfmt.markColor().toUpperCase() };
+          const angle = wrap(tfGaugeAngle(tip.xy[0], tip.xy[1], c));
+          needle = { angle, length: far, color: pfmt.markColor().toUpperCase(), end: { mark: tip, loc: marks.loc, angle } };
         }
         continue;
       }
@@ -5431,8 +5535,38 @@ function buildMapGaugeModel(model, sheetName, summary) {
       .find(r => r.attr === "stroke-color");
     tfLog(`Gauge (map): ${ranges.length} arcs → ${bands.length} bands over ${span.toFixed(1)}° from ${start.toFixed(1)}°, ` +
           `hole ${(r0 / R).toFixed(2)}, needle ${needle ? needle.angle.toFixed(1) + "°" : "none"}, hub ${hub ? "yes" : "no"}, ${texts.length} texts`);
+    /** an arc's end or the needle's tip as a formula of the parameters' cells: the angle of its mark's position,
+     * in this frame (whole turns as exported); null when no parameter cell moves it or it cannot be written */
+    const angleFormula = (end, paramCell) => {
+      if (!end || !end.mark) return null;
+      try {
+        const { mark, loc } = end;
+        let X, Y;
+        if (loc.spatial) {
+          const p = ctx.excelField(mark.row, loc.spatial.ds, paramCell, [loc.spatial.name]);
+          if (!p.pt) return null;
+          ({ x: X, y: Y } = p.pt);
+        } else {
+          X = ctx.excelField(mark.row, loc.xy.x.ds, paramCell, [loc.xy.x.name]);
+          Y = ctx.excelField(mark.row, loc.xy.y.ds, paramCell, [loc.xy.y.name]);
+        }
+        if ("c" in X && "c" in Y) return null;
+        const turn = 360 * Math.round((end.angle - tfGaugeAngle(mark.xy[0], mark.xy[1], c)) / 360);
+        return `(DEGREES(ATAN2((${tfExcelOf(Y)})-(${tfExcelOf({ c: c.cy })}),(${tfExcelOf(X)})-(${tfExcelOf({ c: c.cx })})))${turn ? `+${turn}` : ""})`;
+      } catch (e) { return null; }
+    };
     return {
       kind: "map", start, span, bands, holeRatio: r0 / R, needle, hub, texts,
+      /** the dial's band ends (each band's To; the first band's From) and the needle as formulas of the parameter
+       * cells – a number where nothing moves it; null when no angle follows a cell */
+      live: paramCell => {
+        const ends = bands.map(b => angleFormula(b.toEnd, paramCell));
+        const first = angleFormula(bands[0].fromEnd, paramCell);
+        const nd = needle ? angleFormula(needle.end, paramCell) : null;
+        if (!ends.some(Boolean) && !first && !nd) return null;
+        const dial = ends.some(Boolean) || first;
+        return { ends: dial ? bands.map((b, i) => ends[i] || String(b.to)) : null, first: dial ? first || String(bands[0].from) : null, needle: nd };
+      },
       extent: { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) },
       stroke: strokeRule ? (tfArgb(strokeRule.value) || "").slice(2) || null : null,
       font: pieFont(fmt.labelFont({}))
@@ -5448,7 +5582,7 @@ function buildMapGaugeModel(model, sheetName, summary) {
  * The gauge on the chart data sheet: one row per dial band and the needle's three wedges, in degrees, so the
  * chart's series are linked to cells. @returns {{ dial: any, needle: any, nextRow: number }}
  */
-function writeGaugeData(ds, startRow, gauge, name) {
+function writeGaugeData(ds, startRow, gauge, name, live) {
   ds.getCell(startRow, 1).value = name;
   ds.getCell(startRow, 1).font = { bold: true };
   ["Dial band", "Degrees", "From (°)", "To (°)", "Colour"].forEach((h, k) => { ds.getCell(startRow + 1, k + 1).value = h; });
@@ -5456,10 +5590,23 @@ function writeGaugeData(ds, startRow, gauge, name) {
   let row = startRow + 2;
   const dial = gaugeDialSlices(gauge);
   const first = row;
-  dial.forEach(s => {
+  // live (gauge.live): each band's To from its end's formula, measured from the dial's start; its From the band
+  // before's To – the wedges stay in order and add up to the circle
+  // ponytail: the bands' layering is the export's – a level dragged below the one before collapses to 0°
+  const rel = f => `(${f})-(${gauge.start})`;
+  const ends = live && live.ends ? [rel(live.first), ...live.ends.map(rel), null] : null;
+  dial.forEach((s, i) => {
     [s.name, s.value, s.from, s.to, s.color ? "#" + s.color : "(see-through)"].forEach((v, k) => { ds.getCell(row, k + 1).value = v; });
+    if (ends) {
+      const prev = i ? `D${row - 1}` : "0";
+      const to = i === 0 ? `MAX(0,${ends[0]})` : ends[i] ? `MAX(${prev},${ends[i]})` : `MAX(${prev},360)`;
+      ds.getCell(row, 3).value = { formula: prev, result: s.from };
+      ds.getCell(row, 4).value = { formula: to, result: s.to };
+      ds.getCell(row, 2).value = { formula: `D${row}-C${row}`, result: s.value };
+    }
     row++;
   });
+  const lastTo = ends ? `$D$${row - 2}` : null;          // the last band's (before the see-through rest)
   const dialRef = { sheet: ds.name, cat: `$A$${first}:$A$${row - 1}`, val: `$B$${first}:$B$${row - 1}` };
   let needleRef = null;
   const nd = gaugeNeedleSlices(gauge);
@@ -5468,6 +5615,11 @@ function writeGaugeData(ds, startRow, gauge, name) {
     ds.getCell(row, 1).value = "Needle"; ds.getCell(row, 1).font = { bold: true };
     const f = ++row;
     nd.forEach(s => { ds.getCell(row, 1).value = s.name; ds.getCell(row, 2).value = s.value; row++; });
+    if (live && live.needle) {                                 // gaugeNeedleSlices's wedges, of the needle's formula
+      const w = nd[1].value, span = lastTo || String(gauge.span);
+      ds.getCell(f, 2).value = { formula: `MAX(0,MAX(0,MIN(${span},${rel(live.needle)}))-${w / 2})`, result: nd[0].value };
+      ds.getCell(f + 2, 2).value = { formula: `360-B${f}-B${f + 1}`, result: nd[2].value };
+    }
     needleRef = { sheet: ds.name, cat: `$A$${f}:$A$${row - 1}`, val: `$B$${f}:$B$${row - 1}` };
   }
   return { panes: { dial: dialRef, needle: needleRef }, nextRow: row + 1 };
@@ -5478,7 +5630,10 @@ function gaugeDialSlices(gauge) {
   const out = gauge.bands.map(b => ({ name: b.name || "Band", value: +(b.to - b.from).toFixed(4),
     from: +(b.from - gauge.start).toFixed(2), to: +(b.to - gauge.start).toFixed(2), color: b.color }));
   const rest = 360 - gauge.span;
-  if (rest > 0.01) out.push({ name: "(hidden)", value: +rest.toFixed(4), from: +gauge.span.toFixed(2), to: 360, color: null });
+  // a dial that follows its parameter cells (gauge.liveDial): a see-through wedge before it and the rest, always –
+  // their sizes change with the cells
+  if (gauge.liveDial) out.unshift({ name: "(before the dial)", value: 0, from: 0, to: 0, color: null });
+  if (rest > 0.01 || gauge.liveDial) out.push({ name: "(hidden)", value: +Math.max(0, rest).toFixed(4), from: +gauge.span.toFixed(2), to: 360, color: null });
   return out;
 }
 
@@ -7522,6 +7677,25 @@ function writeIndividualFilterTable(worksheet, filterName, filterValues, originR
   return (titled ? 1 : 0) + values.length;
 }
 
+/** a number parameter's control cell (writeIndividualFilterTable's value cell) as the number, in Tableau's format –
+ * formulas read it (a map gauge's dial and needle) */
+function writeParamNumber(worksheet, item) {
+  const cv = item.param.currentValue, v = paramNumberOf(cv);
+  const cell = worksheet.getCell(item.gridRow + (item.noTitle ? 0 : 1) + 1, item.gridCol + 1);
+  cell.value = v;
+  cell.numFmt = inferExcelNumFmt(cv.formattedValue, v) || "General";
+}
+
+/** a parameter's current value as a number, or null: nativeValue is the native type; value may be its text ("0.4") */
+function paramNumberOf(cv) {
+  if (!cv) return null;
+  for (const v of [cv.nativeValue, cv.value]) {
+    if (typeof v === "number" && isFinite(v)) return v;
+    if (typeof v === "string" && /^\s*-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?\s*$/.test(v)) return Number(v);
+  }
+  return null;
+}
+
 function writeDashboardTitle(worksheet, dashboardName, originRow, originCol, rangeTracker, titleProps, titleRuns) {
   let r = originRow;
   const C = originCol;
@@ -8220,7 +8394,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-05 dc773f8e";
+const EXTENSION_BUILD = "2026-11-05 b796ea71";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -12414,7 +12588,8 @@ function plainFilter(f) {
            periodType: f.periodType, rangeType: f.rangeType, rangeN: f.rangeN };
 }
 function plainParameter(p) {
-  return { name: p.name, currentValue: p.currentValue ? { value: ownRealm(p.currentValue.value), formattedValue: p.currentValue.formattedValue } : null };
+  return { name: p.name, currentValue: p.currentValue ? { value: ownRealm(p.currentValue.value), nativeValue: ownRealm(p.currentValue.nativeValue),
+                                                          formattedValue: p.currentValue.formattedValue } : null };
 }
 /** a DashboardObject: what the layout uses (the id is the zone id in the workbook – text boxes / images need it) */
 function plainObject(o) {
@@ -16821,12 +16996,27 @@ setTableVisibleRows(placedItems);
       if (item.visualModel && item.visualModel.gauge) {
         const status = visualStatuses.find(entry => entry.worksheet === item.name);
         const titleRows = writeGraphicTitle(item);
-        const data = writeGaugeData(chartDataSheetOf(), chartData.row + 1, item.visualModel.gauge, item.name);
+        const gauge = item.visualModel.gauge;
+        // a number parameter shown on this dashboard: its value cell (writeIndividualFilterTable's), made a number the
+        // gauge's formulas read
+        const paramCell = info => {
+          const ctl = info && adjustedItems.find(it => it.type === "filterValue" && it.isParameter && it.param && paramNumberOf(it.param.currentValue) !== null &&
+                                                       [info.caption, info.name].some(n => n && tfNorm(n) === tfNorm(it.param.name)));
+          if (!ctl) return null;
+          ctl.paramNumber = ctl.param.followed = true;            // (the item is a placed copy: the report reads param)
+          writeParamNumber(worksheet, ctl);
+          return sheetRef(worksheet.name, `$${getExcelColumnName(ctl.gridCol)}$${ctl.gridRow + (ctl.noTitle ? 0 : 1) + 1}`);
+        };
+        const live = gauge.live ? gauge.live(paramCell) : null;
+        gauge.liveDial = !!(live && live.ends);
+        const data = writeGaugeData(chartDataSheetOf(), chartData.row + 1, gauge, item.name, live);
         chartData.row = data.nextRow - 1;
         pieJobs.push({ item, top: item.gridRow + titleRows, panes: data.panes, gauge: true });
         reserveGraphicBlock(item);
         item.visualModel.status = "success";
-        item.visualModel.statusReason = "Excel gauge (doughnut dial + pie needle) rebuilt from the workbook's calculations";
+        item.visualModel.statusReason = "Excel gauge (doughnut dial + pie needle) rebuilt from the workbook's calculations" +
+          (live ? ` – its ${[live.ends && "dial", live.needle && "needle"].filter(Boolean).join(" and ")} follow the parameter cells`
+            : " – fixed angles: no number parameter shown on the dashboard moves its dial or needle");
         if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
         continue;
       }
@@ -16989,6 +17179,7 @@ setTableVisibleRows(placedItems);
           tracker,
           item.gridW
         );
+        if (item.paramNumber) writeParamNumber(worksheet, item);
         if (!item.layout) colWidths[item.gridCol] = Math.max(colWidths[item.gridCol] || 0, 35);
       } else if (item.image) {
         tracker.update(item.gridRow, item.gridCol);                 // the picture goes in once the columns are sized
@@ -17314,7 +17505,7 @@ setTableVisibleRows(placedItems);
                                  output: "Picture" })),
       ...pieLegendItems.map(it => ({ name: it.visualName, kind: "Colour legend", output: "Cells: a colour key per item" })),
       ...filterValueItems.map(it => ({ name: it.filterName, kind: it.isParameter ? "Parameter control" : "Filter card",
-                                       output: it.isParameter ? (it.paramFields ? "Date dropdowns: the visuals follow them" : it.dateOnly ? "Date dropdowns (no visual on this sheet uses it)" : "Cells: its value")
+                                       output: it.isParameter ? (it.paramFields ? "Date dropdowns: the visuals follow them" : it.dateOnly ? "Date dropdowns (no visual on this sheet uses it)" : it.param && it.param.followed ? "Cells: its value (the gauge follows it)" : "Cells: its value")
                                          : it.slicer ? "Excel slicer (its selection as in Tableau)"
                                          : it.control ? controlOutput(it.control.field)
                                          : "Cells: the selected values" })),

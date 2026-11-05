@@ -21,6 +21,8 @@ const skipEcom = has(ECOM) ? false : "TFX_WORKBOOKS has no Ecommerce_Dashboard.t
 const skipLogi = has(LOGI) ? false : "TFX_WORKBOOKS has no Untitled_17.twbx";
 const GAUGE = path.join(DIR, "Gauge Charts.twbx");
 const skipGauge = has(GAUGE) ? false : "TFX_WORKBOOKS has no Gauge Charts.twbx";
+const TEMPLATE = path.join(DIR, "Gauge Chart Template.twbx");
+const skipTemplate = has(TEMPLATE) ? false : "TFX_WORKBOOKS has no Gauge Chart Template.twbx";
 
 /** the workbook exported (one dashboard, or ALL) → { log, file } */
 async function exportOf(twbx, dashboard, env, name) {
@@ -65,6 +67,26 @@ test("Gauge Charts: gauges whose slices are Measure Values calculations recalcul
   // a slice: its member's calculation over the rows the slicers keep (fill_r = MAX(MIN(1, MAX(0, on-time %)), 0.5) - 0.5)
   const data = (await xmlParts(file.zip))[`xl/worksheets/sheet${file.sheets.indexOf("Chart Data") + 1}.xml`];
   assert.ok(/<f>IF\(COUNTIFS\([^<]*MAX\(MIN\(1,MAX\(0,/.test(data.replace(/&apos;/g, "'")), "slice formulas");
+});
+
+test("Gauge Chart Template: a map gauge's dial and needle are formulas of its parameter cells", { skip: skipTemplate }, async () => {
+  // its data is a .hyper extract: the summary rows Tableau gives (placeholder rows level × value, the needle's points)
+  const dv = v => ({ value: v, nativeValue: v, formattedValue: String(v) }), NUL = { value: null, nativeValue: null, formattedValue: "Null" };
+  const columns = ["level", "value", "point", "SUM(Sales)", "gauge", "Gauge Point"].map((n, i) => ({ fieldName: n, dataType: i < 3 ? "integer" : i === 3 ? "float" : "string", index: i }));
+  const data = [];
+  for (let l = 5; l >= 1; l--) for (let v = 1; v <= 401; v++) data.push([dv(l), dv(v), NUL, NUL, dv("pt"), NUL]);
+  for (let p = 1; p <= 2; p++) data.push([NUL, NUL, dv(p), dv(2297200.86), NUL, dv("pt")]);
+  const given = tempXlsx("template-summary.json");
+  fs.writeFileSync(given, JSON.stringify({ "Base Gauge": { columns, data } }));
+  const { file } = await exportOf(TEMPLATE, "Dashboard 1", { SUMMARY: given }, "template.xlsx");
+  const parts = await xmlParts(file.zip);
+  const data2 = parts[`xl/worksheets/sheet${file.sheets.indexOf("Chart Data") + 1}.xml`].replace(/&apos;/g, "'");
+  // Level 1 (B7) / Over Target (B14) set the first band's end; the needle reads Target (B17)
+  assert.match(data2, /<f>MAX\(D3,\(\(DEGREES\(ATAN2\([^<]*'Dashboard 1'!\$B\$7\/'Dashboard 1'!\$B\$14/);
+  assert.match(data2, /<f>MAX\(0,MAX\(0,MIN\(\$D\$8,[^<]*'Dashboard 1'!\$B\$17/);
+  // the parameter cells are numbers in Tableau's format, not text
+  const dash = parts["xl/worksheets/sheet1.xml"];
+  assert.match(dash, /<c r="B7" [^>]*><v>0\.4<\/v>/);
 });
 
 test("Ecommerce exported at Channel = Website: the pie gets the other channels", { skip: skipEcom }, async () => {

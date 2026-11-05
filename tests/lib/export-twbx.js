@@ -36,7 +36,7 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
                        ["async function collectAllDashboards(current, onProgress) {", "async function collectAllDashboards(current) { return globalThis.__collect(current); } async function unusedCollect(current, onProgress) {"]] : [];
   // MIXED: visuals named like it keep away from the slicer formulas (a calculation they cannot translate, say)
   if (process.env.MIXED) patch.push(["const binding = slicers.bind(item.vm, item.name, filters, fmtModel);", "const binding = new RegExp(process.env.MIXED).test(item.name) ? \"test: kept off the formulas\" : slicers.bind(item.vm, item.name, filters, fmtModel);"]);
-  const T = load({ dashboard: {}, captureDownload: b => { saved = b; }, expose: ["applyWorkbookXml", "exportToExcel", "tfFieldInfo", "tfParseFieldRef", "FORMAT_CONFIG", "slicerParseCalc", "slicerEval"], patch });
+  const T = load({ dashboard: {}, captureDownload: b => { saved = b; }, expose: ["applyWorkbookXml", "exportToExcel", "tfFieldInfo", "tfParseFieldRef", "FORMAT_CONFIG", "slicerParseCalc", "slicerEval", "tableauToExcelNumFmt", "tfFormatNumber"], patch });
   if (process.env.NODROPDOWN) T.FORMAT_CONFIG.dropdownCards = false;
   if (process.env.NOSLICERS) T.FORMAT_CONFIG.slicers = false;
   // filters set through the API (applyFilterAsync / clearFilterAsync): field caption → the values kept
@@ -137,7 +137,10 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
   const caption = ref => { const info = T.tfFieldInfo(model, ref); return (info && info.caption) || ref.name; };
 
   // ── summary data: the sheet's source-column dimensions, and aggregates of source columns
+  // SUMMARY=<file.json>: { sheet: { columns, data } } – a sheet's summary data given (a .hyper extract this mock cannot read)
+  const given = process.env.SUMMARY ? JSON.parse(fs.readFileSync(process.env.SUMMARY, "utf8")) : {};
   const summary = name => {
+    if (given[name]) return { ...given[name], totalRowCount: given[name].data.length };
     const sh = model.sheets[name];
     if (!sh) return { columns: [], data: [] };
     const refs = [...(sh.rows || []), ...(sh.cols || []), ...(sh.panes || []).flatMap(p => p.encodings.map(e => e.field))].filter(Boolean);
@@ -275,7 +278,14 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
     applyFilterAsync: async (fieldName, values) => { active.set(fieldName, new Set(values.map(v => (v instanceof Date ? iso(v) : String(v))))); return fieldName; },
     clearFilterAsync: async fieldName => { active.delete(fieldName); return fieldName; },
     getFiltersAsync: async () => filtersOf(name), getSelectedMarksAsync: async () => ({ data: [] }), getDataSourcesAsync: async () => dsOf(name) }));
-  return { name: DNAME, objects, worksheets, getParametersAsync: async () => [] };
+  // the workbook's parameters as the Extensions API gives them: name = caption, a number's value with its format
+  const params = Object.entries(model.fields).filter(([k, f]) => /^Parameters\|/.test(k) && f.param).map(([, f]) => {
+    const raw = String(f.value ?? "").replace(/^"|"$/g, ""), num = /^(real|integer|float|int)$/i.test(f.datatype || "") ? Number(raw) : NaN;
+    const nf = isFinite(num) && f.defaultFormat ? T.tableauToExcelNumFmt(f.defaultFormat) : null;
+    return { id: `[Parameters].[${f.name}]`, name: f.caption || f.name, dataType: f.datatype,
+             currentValue: isFinite(num) ? { value: String(num), nativeValue: num, formattedValue: nf ? T.tfFormatNumber(num, nf) : String(num) } : dv(raw) };
+  });
+  return { name: DNAME, objects, worksheets, getParametersAsync: async () => params };
   };
   const names0 = ALL ? Object.keys(model.dashboards) : [DASH];
   const first = build(names0[0]);
