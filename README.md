@@ -165,7 +165,7 @@ Visual fidelity follows the strategies above; the Conversion Report names every 
 - **Maps** of every kind are exported as tables of their marks (location fields and values): Excel's map charts cannot reproduce Tableau's geography, layers or colour scales reliably.
 - **Calculations** – calculated fields, LOD expressions, table calculations – arrive as Tableau's computed values. Only the values of visuals that follow a slicer become Excel formulas (sums, averages, min / max, counts and calculations of those); the report lists each calculation and its kind.
 - **Filters and parameters**: a filter card of a field's values becomes a slicer (several values) or a dropdown cell (one value), and a range of dates From / To cells, that cross-filter the visuals of its data source (see *Slicers*); relative-date and measure filters and parameters apply as they were at export time, and the report lists them. Excel has no live link back to Tableau.
-- **Tooltips** appear on hover for pies, donuts (not when they follow a slicer) and packed bubbles; elsewhere their fields are in the data only. Filter actions become slicers (see *Slicers*); hover actions, highlighting and drill-down are not reproduced.
+- **Tooltips** appear on hover for pies, donuts (not when they follow a slicer), pie gauges and packed bubbles; elsewhere their fields are in the data only. Filter actions become slicers (see *Slicers*); hover actions, highlighting and drill-down are not reproduced.
 - **Shapes and sizes** Excel cannot draw (custom shape images in charts, bar widths by a measure, rounded bar ends) are left out and named in the report.
 
 The project should be evaluated against representative dashboards containing the visual types and formatting features it claims to support.

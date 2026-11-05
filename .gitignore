@@ -2,4 +2,8 @@
 *.zip
 .vscode/
 *.twbx
-/*.twb
+*.twb
+~*.twbr
+/workbooks/
+*.xlsx
+~$*

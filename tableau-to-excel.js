@@ -2288,6 +2288,15 @@ function tvMeasureMark(roles, ref, fallback, index, count) {
 
 /** @param {Roles} roles @param {FieldRef | null} ref @returns {boolean} */
 function tvLabelsOn(roles, ref) {
+  // a dual axis: the measure's own pane decides, else the All pane (a bullet labels its spend bars, not the budget
+  // bars behind them)
+  const own = ref && roles.panes.find(p => p.id && [p.yAxisName, p.xAxisName].some(n => n && tfSameField(tfParseFieldRef(n), ref)));
+  if (own) {
+    const all = roles.panes.find(p => !p.id);
+    const rule = tvPaneRule(own, "mark", "mark-labels-show") ?? tvPaneRule(all, "mark", "mark-labels-show");
+    if (rule !== undefined) return rule === "true";
+    return [own, all].some(p => p && ((p.labelRuns || []).length || (p.encodings || []).some(e => e.channel === "text" || e.channel === "label")));
+  }
   const shown = roles.panes.some(p => tvPaneRule(p, "mark", "mark-labels-show") === "true");
   if (shown) return true;
   if (!ref) return false;
@@ -4742,8 +4751,8 @@ function buildPieCharts(pie, block, paneRefs, o) {
     const holeTip = holeD && pie.hole.tipFor(pts);
     out.push({ x, y, w: pw, h: ph, name: o.name, xml: pieChartXml(spec),
                shapes: texts.length ? userShapesXml(texts, { w: pw, h: ph }) : null,
-               // a gauge stays a plain, editable Excel chart: no tooltip wedges grouped over it
-               tips: pie.gauge || bound ? [] : [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
+               // a gauge's slices keep Tableau's numbers even while it follows the slicers: its tooltip wedges stay true
+               tips: bound ? [] : [...tipsOf(shown, D, holeD || (innerPts.length ? innerD : 0), { w: pw, h: ph }),
                       ...(holeTip ? [{ x: (pw - holeD) / 2, y: (ph - holeD) / 2, w: holeD, h: holeD, prst: "ellipse", text: holeTip, link: o.link }] : [])] });
     if (!innerPts.length) return;
     // nested donut: the inner pie is its own see-through chart exactly over the ring's hole (drawn after = on top);
@@ -8199,7 +8208,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-03 bb641c14";
+const EXTENSION_BUILD = "2026-11-05 69a65116";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -10611,7 +10620,7 @@ function writeConversionReport(workbook, report) {
     ...(report.slicers && report.slicers.length ? [SLICER_REPORT_NOTE] : []),
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
-    "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
+    "Tooltips: pies, donuts, gauges and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
     "Filter actions (click a mark to filter) become a slicer of the clicked field above their source chart, filtering the sheets the action targets; hover actions, highlighting and drill-down are not reproduced.",
     "TABLE_FALLBACK means no Excel chart would show the visual correctly: its data is exported as a table instead (the cell carries a note)."
   ].forEach(t => { r++; put(r, 2, t, font, { alignment: { wrapText: true } }); ws.mergeCells(r, 2, r, 7); ws.getRow(r).height = 24; });
@@ -10697,7 +10706,7 @@ function writeConversionReports(workbook, reports) {
     ...(reports.some(rep => rep.slicers && rep.slicers.length) ? [SLICER_REPORT_NOTE] : []),
     "Values are Tableau's own results for the view: calculated fields, LOD expressions and table calculations are exported as values, not translated into Excel formulas.",
     "Filters, parameters and sets apply as they were at export time; Excel has no live link back to Tableau.",
-    "Tooltips: pies, donuts and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
+    "Tooltips: pies, donuts, gauges and packed bubbles show Tableau's tooltip text on hover; elsewhere the tooltip fields are in the exported data only.",
     "Filter actions (click a mark to filter) become a slicer of the clicked field above their source chart, filtering the sheets the action targets; hover actions, highlighting and drill-down are not reproduced.",
     "TABLE_FALLBACK means no Excel chart would show the visual correctly: its data is exported as a table instead (the cell carries a note)."
   ].forEach(t => { r++; put(r, 2, t, font, { alignment: { wrapText: true } }); ws.mergeCells(r, 2, r, 7); ws.getRow(r).height = 24; });
@@ -10968,9 +10977,9 @@ function dLbls(spec, s, pos, hidden) {
   if (only) hidden = [...new Set([...(hidden || []), ...(s.values || []).map((_, i) => i).filter(i => !only.has(i))])].sort((a, b) => a - b);
   const drop = (hidden || []).map(i => `<c:dLbl><c:idx val="${i}"/><c:delete val="1"/></c:dLbl>`).join("");
   if (s.labelTexts) {
-    // a doughnut takes no label position (Excel refuses the file)
+    // a doughnut takes no label position (Excel refuses the file), nor a stacked bar "r"
     return `<c:dLbls>${drop}<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>${labelTxPr(spec)}` +
-      `${spec.kind === "doughnut" ? "" : `<c:dLblPos val="${pos || "r"}"/>`}<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/>` +
+      `${spec.kind === "doughnut" || !pos ? "" : `<c:dLblPos val="${pos}"/>`}<c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/>` +
       `<c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/>` +
       `<c:extLst><c:ext uri="{CE6537A1-D6FC-4f65-9D91-7224C49458BB}" xmlns:c15="${C15}">` +
       `<c15:showDataLabelsRange val="1"/></c:ext></c:extLst></c:dLbls>`;
@@ -16737,8 +16746,16 @@ setTableVisibleRows(placedItems);
         // an axis range taken from Tableau's values would clip the values another selection gives: Excel scales it
         if (spec.dataRange && spec.dataRange.min) delete spec.valueMin;
         if (spec.dataRange && spec.dataRange.max) delete spec.valueMax;
+        // a bar or point the slicers filter out is NA(), which Excel labels "#N/A": its value label read from a cell
+        // instead (Value From Cells), blank then – as Tableau draws no mark
+        if (!spec.percent) spec.series.forEach((s, k) => {
+          if (!s.labels || s.labelTexts || s.labelParts || s.labelOnly || s.refLine || !/^(bar|line)$/.test(s.type || spec.kind)) return;
+          const fmt = s.labelNumFmt || (s.secondary ? spec.secondaryNumFmt : spec.numFmt) || "General";
+          s.labelTexts = s.values.map(v => (num(v) === null ? "" : tfFormatNumber(v, fmt)));
+          s.labelFormula = (i, at) => `IF(ISNUMBER(${at("series", k, i)}),TEXT(${at("series", k, i)},${xlText(fmt)}),"")`;
+        });
       }
-      spec.widthPx = widthPx;                          // writeChartData fits category names to it
+      spec.widthPx = widthPx;                         // writeChartData fits category names to it
       spec.heightPx = heightPx;
     };
     /** a switch's cell on the chart data sheet, made with its first chart */
