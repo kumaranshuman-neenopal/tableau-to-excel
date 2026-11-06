@@ -110,8 +110,10 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
   const months = ["Jan 24", "Feb 24", "Mar 24"];
   const ive = months.flatMap((m, k) => [[dv(m), dv(m), dv("General - Real Act Seleccionado"), dv(0.4 + k / 10), dv(0.4 + k / 10)],
                                         [dv(m), dv(m), dv("MIN(0)"), dv(0), dv(0.4 + k / 10)]]);
-  const proj = ["City Walk", "Explanada Pachuca"].flatMap((p, k) => [[dv(p), dv("Gauge - One"), dv(1), dv(0)],
-    [dv(p), dv("Gauge - Dynamic Project Chooser Line"), dv([0.9, 0.2][k]), dv(0)]]);
+  // as Tableau gives them: four measures on the path One → Line → Zero → Line (copy), the copy = Line
+  const proj = ["City Walk", "Explanada Pachuca"].flatMap((p, k) => [[dv(p), dv("Min. Gauge - One"), dv(1), dv(0)],
+    [dv(p), dv("Gauge - Dynamic Project Chooser Line"), dv([1, -468.4][k]), dv(0)], [dv(p), dv("Min. Gauge - Zero"), dv(0), dv(0)],
+    [dv(p), dv("Gauge - Dynamic Project Chooser Line (copy)"), dv([1, -468.4][k]), dv(0)]]);
   const given = tempXlsx("noi-summary.json");
   fs.writeFileSync(given, JSON.stringify({
     "Gauge Original NOI (2)": { columns: colsOf(["Segment Color", "Segment ID", "Path Order", "SUM(X)", "SUM(Y)"], ["string", "integer", "integer", "float", "float"]), data: dial },
@@ -120,9 +122,15 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
     "Needle NOI Total NOI|Mes=Enero|Mensual / Acumulado=Acumulado": { columns: needleCols, data: needle(-90) },
     "Needle NOI Bolita NOI": { columns: colsOf(["MIN(Bolita)"], ["float"]), data: [[dv(0)]] },
     "Gauge Valor IvE": { columns: colsOf(["MY(Date)", "General - MY Axis", "Measure Names", "Measure Values", "AGG(General - Real Act Seleccionado (G))"], ["string", "string", "string", "float", "float"]), data: ive },
-    "Gauge Proyectos Centros Comerciales A": { columns: colsOf([" Proyecto", "Measure Names", "Measure Values", "AGG(MIN(0))"], ["string", "string", "float", "float"]), data: proj }
+    "Gauge Proyectos Centros Comerciales A": { columns: colsOf([" Proyecto", "Measure Names", "Measure Values", "AGG(MIN(0))"], ["string", "string", "float", "float"]), data: proj },
+    // the General / Detalle buttons: Text Names labels the marks, Modo Val is what the action sets, EsActivo colours them
+    "Button B": { columns: colsOf(["EsActivo", "Modo", "Text Names", "Modo Val", "SUM(X)", "AGG(MIN(1))"], ["bool", "string", "string", "integer", "integer", "integer"]),
+                  data: [[dv(true, "True"), dv("Grupo de Proyectos"), dv("General"), dv(1), dv(1), dv(1)],
+                         [dv(false, "False"), dv("Proyectos"), dv("Detalle"), dv(2), dv(2), dv(1)]] }
   }));
-  const { log, file } = await exportOf(NOI, "Executive Console", { SUMMARY: given }, "noi.xlsx");
+  // MIXED: the project gauge that uses Grupo Proyecto / Proyecto stays off the slicers (as in Tableau, whose data is a
+  // .hyper), so the General / Detalle button sheet becomes its dropdown
+  const { log, file } = await exportOf(NOI, "Executive Console", { SUMMARY: given, MIXED: "^Gauge Proyectos Mixto A$" }, "noi.xlsx");
   // Mes_TMP only feeds Mes (a bridge action): Tableau is set through Mes alone; Mes × Mensual / Acumulado read as pairs
   assert.match(log, /\[States\] parameter "Mes_TMP": set only through "Mes"/);
   assert.match(log, /\[States\] Executive Console: \d+ filter values \([1-9]\d* pair\(s\) of dropdowns\)/);
@@ -142,6 +150,8 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
   assert.match(parts["xl/sharedStrings.xml"] || states, /0\|Enero\|\|1\|Acumulado/);
   assert.match(states, /<row r="(\d+)"[^>]*>(?:(?!<\/row>).)*<v>-59\.99\d*<\/v>(?:(?!<\/row>).)*<v>-90<\/v>/, "the pair's needle angle on the needle's row");
   assert.match(states, /<c r="A2"[^>]*><f>[^<]*MID\(/);
+  // a key cell of one dropdown: its test made a number ((J4<>"x")=0 is never TRUE in Excel – TRUE / FALSE are not 0)
+  assert.match(states, /<c r="[B-Z]2"[^>]*><f>IF\([^<]*IF\(0\+\(/);
   for (const n of file.sheets) assert.doesNotMatch(sheetXml(n), /<f>IF\(=|MATCH\(,/, `${n}: a formula with an empty key reference`);
   assert.match(sheetXml("Chart Data"), /<f>MAX\(0,MAX\(0,MIN\([^<]*'States Executive Console'!\$[B-Z]\$2[^<]*<\/f><v>149\.2<\/v>/, "the needle reads its own key cell (its dropdowns only)");
   // the orange panel image: its colour behind the cells
@@ -150,6 +160,23 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
   // lollipops: thin bars + dots on one scale; the project bars: track and value overlaid, not stacked
   assert.match(report, /Gauge Valor IvE.*Column chart \(thin bars\) with a dot on each/);
   assert.match(report, /Gauge Proyectos Centros Comerciales A.*Overlaid bar chart/);
+  // the light track (Min. Gauge - One: #FFF2E3) behind, the orange value in front; the copy that repeats it is left out
+  const bars = Object.entries(parts).find(([n, x]) => /^xl\/charts\/chart\d+\.xml$/.test(n) && /Chooser Line/.test(x))[1];
+  const sers = [...bars.matchAll(/<c:ser>.*?<\/c:ser>/gs)].map(m => [(m[0].match(/<c:v>([^<]*)<\/c:v>/) || [])[1], (m[0].match(/srgbClr val="(\w+)"/) || [])[1]]);
+  assert.deepEqual(sers.filter(([n]) => !/Zero/.test(n)), [["Min. Gauge - One", "FFF2E3"], ["Gauge - Dynamic Project Chooser Line", "FBB05C"]]);
+  // the General / Detalle buttons: a dropdown of their labels (Tableau set to the value each sets), and button cells
+  // green (#499202) while the dropdown holds their label, grey (#535355) otherwise
+  assert.match(log, /\[States\] parameter "Grupo Proyecto \/ Proyecto": 2 values, \d+ visual\(s\) use it \(the "Button B" button → a dropdown\)/);
+  const list = [...states.matchAll(/<c r="([A-Z]+)(\d+)"[^>]*t="s"[^>]*><v>(\d+)<\/v>/g)];
+  const strs = [...(parts["xl/sharedStrings.xml"] || "").matchAll(/<si>(.*?)<\/si>/gs)].map(m => m[1].replace(/<[^>]+>/g, ""));
+  const col = list.find(m => strs[+m[3]] === "General");
+  assert.ok(col && list.some(m => m[1] === col[1] && strs[+m[3]] === "Detalle"), "the dropdown's list: General, Detalle");
+  const dash = sheetXml("Executive Console");
+  assert.match(dash, /<cfRule type="expression"[^>]*><formula>'Executive Console'!\$[A-Z]+\$\d+="General"<\/formula>/);
+  assert.match(dash, /<cfRule type="expression"[^>]*><formula>'Executive Console'!\$[A-Z]+\$\d+="Detalle"<\/formula>/);
+  assert.match(parts["xl/styles.xml"], /<dxf><fill><patternFill patternType="solid"><bgColor rgb="FF499202"\/>/);
+  assert.match(parts["xl/styles.xml"], /<fgColor rgb="FF535355"\/>/);
+  assert.match(report, /Grupo Proyecto \/ Proyecto.*Button sheet → dropdown \+ buttons coloured by the dropdown \(General \/ Detalle/);
 });
 
 test("Ecommerce exported at Channel = Website: the pie gets the other channels", { skip: skipEcom }, async () => {

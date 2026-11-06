@@ -310,6 +310,9 @@ const TF_ELEMENTS = {
   divider:    ["table-div"]
 };
 
+/* how Tableau names an aggregated measure in Measure Names / summary columns ("Min. Gauge - One") */
+const TF_DERIV_PREFIX = { avg: "Avg. ", cnt: "Count of ", ctd: "Count Distinct of ", min: "Min. ", max: "Max. ",
+                          med: "Median ", std: "Std. dev. of ", var: "Variance of " };
 const TF_DERIV_LABEL = {
   sum: "SUM", avg: "AVG", cnt: "CNT", ctd: "CNTD", min: "MIN", max: "MAX",
   med: "MEDIAN", attr: "ATTR", usr: "AGG", std: "STDEV", stdp: "STDEVP",
@@ -1044,6 +1047,8 @@ function tfDisplayNames(model, ref) {
   const agg = TF_DERIV_LABEL[(ref.deriv || "").toLowerCase()];
   const names = [];
   if (agg) names.push(`${agg}(${cap})`, `${agg}(${ref.name})`);
+  const pre = TF_DERIV_PREFIX[(ref.deriv || "").toLowerCase()];
+  if (pre) names.push(pre + cap);
   names.push(cap, ref.name);
   if (ref.name === "Multiple Values") names.push("Measure Values");
   const alias = model && model.measureAliases && (model.measureAliases[tfRefKey(ref)] ||
@@ -1584,8 +1589,7 @@ function createSheetFormatter(model, sheetName, onlyPanes) {
               : ref && !/^Calculation_/.test(ref.name) ? ref.name
               : String(fallbackName || "").replace(/^[A-Z]+\((.*)\)$/, "$1");
       const d = ref && (ref.deriv || "").toLowerCase();
-      const pre = { avg: "Avg. ", cnt: "Count of ", ctd: "Count Distinct of ", min: "Min. ", max: "Max. ",
-                    med: "Median ", std: "Std. dev. of ", var: "Variance of " }[d];
+      const pre = TF_DERIV_PREFIX[d];
       return pre ? pre + cap : cap;
     },
     /* title text with <Sheet Name>, <[field]> and <[Parameters].[p]> substituted */
@@ -3105,6 +3109,11 @@ function tvCartesianSpecs(ctx) {
       const vals = s => (s.values || []).filter(v => v !== null && v !== undefined);
       const track = s => { const v = vals(s); return v.length > 1 && v.every(x => x === v[0]); };
       const len = s => Math.max(0, ...vals(s).map(Math.abs));
+      // a measure with the same values as one before it (a path One → Line → Zero → Line (copy)): Tableau colours
+      // each segment by the point it starts from, so the repeat's own colour never shows – drawn on top it would
+      // hide the value bar under its (track) colour
+      const same = (a, b) => (a.values || []).length === (b.values || []).length && a.values.every((v, i) => v === b.values[i]);
+      series = series.filter((s, i) => !series.slice(0, i).some(p => same(p, s)));
       series = [...series].sort((a, b) => (track(b) - track(a)) || len(b) - len(a));
     }
     const stacked = !overlaid && stackable && series.length > 1 && !ctx.clustered &&
@@ -8765,7 +8774,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-06 9f89a1df";
+const EXTENSION_BUILD = "2026-11-06 81f44b77";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -15677,6 +15686,10 @@ function writeControlCard(worksheet, item, tracker) {
   const dateOf = serial => new Date(Math.round((serial - 25569) * 86400000));
   const values = list ? [field.current === null ? SLICER_ALL : field.current]
     : numeric ? [field.lo ?? "", field.hi ?? ""] : [dateOf(field.lo), dateOf(field.hi)];
+  // a button sheet's dropdown: under it a cell per button, equal parts of the card's width (narrower than one cell
+  // each: the dropdown only)
+  const marks = list && !field.control && item.buttons;
+  const bw = marks ? Math.floor((item.gridW || 1) / marks.labels.length) : 0;
   writeIndividualFilterTable(worksheet, item.noTitle ? null : item.filterName || field.header, values, item.gridRow, item.gridCol, tracker, item.gridW);
   const cells = values.map((v, i) => worksheet.getCell(item.gridRow + (item.noTitle ? 1 : 2) + i, item.gridCol + 1));
   const ref = cell => { const m = String(cell.address).match(/^([A-Z]+)(\d+)$/); return sheetRef(worksheet.name, `$${m[1]}$${m[2]}`); };
@@ -15698,6 +15711,22 @@ function writeControlCard(worksheet, item, tracker) {
     c.dataValidation = { type: "list", allowBlank: false, formulae: [field.listRef], showErrorMessage: true,
                          errorTitle: field.header, error: "Pick a value from the list." };
     field.control = { cell: ref(c) };
+    // the buttons: the inactive mark's fill, the active one's while the dropdown holds its label (conditional format)
+    if (bw) marks.labels.forEach((label, k) => {
+      const r = c.row + 1, c0 = item.gridCol + k * bw;          // r 1-based, c0 0-based first column of this button
+      if (bw > 1) { try { worksheet.mergeCells(r, c0 + 1, r, c0 + bw); } catch (e) { /* already merged */ } }
+      const b = worksheet.getCell(r, c0 + 1);
+      b.value = label;
+      b.font = { ...c.font, bold: true, color: { argb: "FFFFFFFF" } };
+      b.alignment = { horizontal: "center", vertical: "middle", shrinkToFit: true };
+      b.fill = { type: "pattern", pattern: "solid", fgColor: { argb: marks.off } };
+      const gap = { style: "medium", color: { argb: "FFFFFFFF" } };   // apart, as Tableau's buttons
+      b.border = { left: gap, right: gap };
+      worksheet.addConditionalFormatting(/** @type {any} */ ({ ref: b.address, rules: [{ type: "expression",
+        formulae: [`${field.control.cell}=${xlText(label)}`], style: { fill: { type: "pattern", pattern: "solid", bgColor: { argb: marks.on } } } }] }));
+      tracker.update(r - 1, c0 + bw - 1);
+    });
+    if (bw) marks.drawn = true;                                 // for the report (item is a copy of the card)
   } else if (numeric) {
     // a number; empty: no bound on that side ("at least" / "at most")
     cells.forEach(c => {
@@ -16103,6 +16132,43 @@ function sheetUsesParam(model, sheetName, names) {
 }
 
 /**
+ * A button sheet's marks read from its summary data: the label each shows (its Text encoding, "General") for the
+ * parameter value its action sets (the action's source field → the list member, "Grupo de Proyectos"), and the fill of
+ * the active mark and of the others (its Color encoding). null when that data does not give a label to every value.
+ * @param {FormatModel | null} fmtModel @param {any} button @param {any} action @param {any[]} members the list's values
+ * @param {string[]} choices the members' texts @param {string} current
+ * @returns {{ labels: string[], aliasOf: Record<string, string>, current: string, on: string, off: string } | null}
+ */
+function buttonMarks(fmtModel, button, action, members, choices, current) {
+  const sum = button.summary, sheet = fmtModel && fmtModel.sheets && fmtModel.sheets[button.name];
+  if (!sum || !sheet || !action.field) return null;
+  const columns = sum.columns || [];
+  const colOf = ref => { const names = ref ? tfDisplayNames(fmtModel, ref) : []; return columns.findIndex(c => names.includes(tfNorm(c.fieldName))); };
+  const encs = (sheet.panes || []).flatMap(q => q.encodings || []);
+  const ti = colOf((encs.find(e => (e.channel === "text" || e.channel === "label") && e.field) || {}).field);
+  const vi = colOf(tfParseFieldRef(action.field));
+  if (ti < 0 || vi < 0) return null;
+  const raw = dv => String(dv.value ?? dv.formattedValue);
+  const fmt = button.vm && button.vm.fmt, enc = fmt && fmt.colorEncoding();
+  const ci = enc ? colOf(enc.ref) : -1;
+  const scale = ci >= 0 ? tfBuildColorScale(fmt, enc, (sum.data || []).map(r => (enc.continuous ? tfDvNum(r[ci]) : tfDvText(r[ci])))) : null;
+  const aliasOf = {}, labels = [];
+  let label = null, on = null, off = null;
+  for (const r of sum.data || []) {
+    const m = members.find(dv => raw(dv) === raw(r[vi]) || tfDvText(dv) === tfDvText(r[vi]));
+    const text = tfDvText(r[ti]);
+    if (!m || !text || text in aliasOf) continue;
+    const alias = String(m.formattedValue ?? m.value);
+    aliasOf[text] = alias;
+    labels.push(text);
+    const fill = scale ? scale(enc.continuous ? tfDvNum(r[ci]) : tfDvText(r[ci])) : null;
+    if (alias === current) { label = text; on = fill; } else off = off || fill;
+  }
+  if (label === null || labels.length !== choices.length || !choices.every(c => Object.values(aliasOf).includes(c))) return null;
+  return { labels, aliasOf, current: label, on: on || "FF4E79A7", off: off || "FFA6A6A6" };
+}
+
+/**
  * List parameters the dashboard sets – shown as a parameter control, or set by a button sheet (a parameter action) –
  * as dropdown cards read value by value like a filter's: each value set in Tableau (changeValueAsync takes a list's
  * alias), the visuals read, the export's value put back. A button's sheet becomes that dropdown, in its place.
@@ -16168,12 +16234,16 @@ async function parameterStateCards(o, visuals) {
       dataWorksheetItems.splice(k, 1);
       const v = visuals.indexOf(button);
       if (v >= 0) visuals.splice(v, 1);
-      card = { type: "filterValue", isParameter: true, name: button.name, visualName: p.name, filterName: p.name, values: [current],
+      const got = buttonMarks(fmtModel, button, action, p.allowableValues.allowableValues || [], choices, current);
+      card = { type: "filterValue", isParameter: true, name: button.name, visualName: p.name, filterName: p.name, values: [got ? got.current : current],
                layout: button.layout, rowCount: 2, fixedGridW: button.fixedGridW, param: { name: p.name, currentValue: p.currentValue }, button: button.name,
-               noTitle: !(button.vm && button.vm.showTitle) || undefined };   // the button's sheet title shown or not
+               buttons: got || undefined, noTitle: !(button.vm && button.vm.showTitle) || undefined };   // the button's sheet title shown or not
       filterValueItems.push(card);
     }
-    out.push({ card, kind: "list", field: undefined, choices, current, on: [], affects, raw: { fieldName: p.name }, param: p,
+    // a button's dropdown lists the buttons' labels (General / Detalle); Tableau is set to the parameter value each sets
+    const marks = card.buttons;
+    out.push({ card, kind: "list", field: undefined, choices: marks ? marks.labels : choices, current: marks ? marks.current : current,
+               aliasOf: marks ? marks.aliasOf : undefined, on: [], affects, raw: { fieldName: p.name }, param: p,
                ids: [...ids, ...targets.flatMap(t => idsOf(t.param))], ownIds: ids, targets });
     console.log(`[States] parameter "${p.name}": ${choices.length} values, ${affects.length} visual(s) use it` +
                 `${targets.length ? ` (copied into ${targets.map(t => `"${t.param.name}"`).join(", ")} by a parameter action)` : ""}` +
@@ -16306,9 +16376,10 @@ async function addFilterStates(o) {
   const valueText = v => (v.value !== null && v.value !== undefined ? v.value : v.formattedValue);
   const setTo = async (c, choice) => {
     if (c.param) {                                             // a parameter's list: its alias / value (and the ones it is copied into)
-      const to = (c.targets || []).filter(t => t.choices.includes(choice));
-      if (!c.skipSelf || !to.length) { await c.param.changeValueAsync(choice); c.selfSet = true; }
-      for (const t of to) await t.param.changeValueAsync(choice);
+      const v = c.aliasOf ? c.aliasOf[choice] : choice;        // a button's label: the value it sets
+      const to = (c.targets || []).filter(t => t.choices.includes(v));
+      if (!c.skipSelf || !to.length) { await c.param.changeValueAsync(v); c.selfSet = true; }
+      for (const t of to) await t.param.changeValueAsync(v);
       return true;
     }
     const dv = choice === SLICER_ALL ? null : c.valueOf(choice);
@@ -16320,7 +16391,7 @@ async function addFilterStates(o) {
   const restore = async c => {
     if (c.param) {
       const back = (q, v) => (v === null ? Promise.resolve() : q.changeValueAsync(v)).catch(e => console.warn(`[States] parameter "${q.name}" could not be put back: ${e.message}`));
-      if (c.selfSet || !c.skipSelf) await back(c.param, c.current);
+      if (c.selfSet || !c.skipSelf) await back(c.param, c.aliasOf ? c.aliasOf[c.current] : c.current);
       c.selfSet = false;
       for (const t of c.targets || []) await back(t.param, t.current);
       return;
@@ -16416,7 +16487,7 @@ async function addFilterStates(o) {
     c.field = { kind: "list", header: c.card.filterName || c.raw.fieldName, current: c.current === SLICER_ALL ? null : c.current,
                 listRef: cellRef(name, col, 0, col, c.choices.length - 1), states: true };
     c.card.control = { field: c.field };
-    c.card.rowCount = c.card.noTitle ? 1 : 2;
+    c.card.rowCount = (c.card.noTitle ? 1 : 2) + (c.card.buttons ? 1 : 0);   // a button sheet's: the buttons' row under it
   });
 
   /** a visual's value for every state: its rows' measure ci found again in each state's data (by their dimensions) */
@@ -16577,12 +16648,12 @@ async function addFilterStates(o) {
       S.getCell("A1").value = { formula: uniq.length ? uniq.join("+") : "0", result: 0 };
       // the dropdowns changed (only dropdowns: a slicer changed too has no state read), as the states' keys: "0|Enero||2|Acumulado"
       const A1 = cellRef(name, 0, 0);
-      S.getCell("A2").value = { formula: `IF(${A1}=0,"=",IF(${A1}=${listFlags},MID(${parts.length ? parts.join("&") : '""'},${SEP.length + 1},999),""))`, result: "=" };
+      S.getCell("A2").value = { formula: `IF(${A1}=0,"=",IF(${A1}=0+${listFlags},MID(${parts.length ? parts.join("&") : '""'},${SEP.length + 1},999),""))`, result: "=" };
       // each set of dropdowns' key: "=" while none of them is changed, "" while a slicer or date range is (not read)
       const others = uniq.filter(x => !flags.slice(0, nList).includes(x));
       for (const [sig, ref] of keyCells) {
         const own = sig.split(",").filter(Boolean).map(Number).map(k => byCard.get(k)).filter(Boolean);
-        const changed = own.length ? own.map(x => x.flag).join("+") : "0";
+        const changed = `0+${own.length ? own.map(x => x.flag).join("+") : "0"}`;   // 0+: one test alone is TRUE / FALSE, never = 0
         const key = own.length ? `MID(${own.map(x => x.part).join("&")},${SEP.length + 1},999)` : '""';
         const at = ref.slice(ref.lastIndexOf("!") + 1).replace(/\$/g, "");
         S.getCell(at).value = { formula: `IF(${others.length ? others.join("+") : "0"}>0,"",IF(${changed}=0,"=",${key}))`, result: "=" };
@@ -18247,7 +18318,8 @@ setTableVisibleRows(placedItems);
       ...backdropObjects,
       ...pieLegendItems.map(it => ({ name: it.visualName, kind: "Colour legend", output: "Cells: a colour key per item" })),
       ...filterValueItems.map(it => ({ name: it.filterName, kind: it.isParameter ? "Parameter control" : "Filter card",
-                                       output: it.isParameter ? (it.control ? `Dropdown cell${it.button ? ` (in place of the "${it.button}" button)` : ""}: the visuals that use it show Tableau's numbers for each value`
+                                       output: it.isParameter ? (it.buttons && it.buttons.drawn ? `Button sheet → dropdown + buttons coloured by the dropdown (${it.buttons.labels.join(" / ")}, in place of the "${it.button}" button): the visuals that use it show Tableau's numbers for each value`
+                                         : it.control ? `Dropdown cell${it.button ? ` (in place of the "${it.button}" button)` : ""}: the visuals that use it show Tableau's numbers for each value`
                                          : it.paramFields ? "Date dropdowns: the visuals follow them" : it.dateOnly ? "Date dropdowns (no visual on this sheet uses it)" : it.param && it.param.followed ? "Cells: its value (the gauge follows it)" : "Cells: its value")
                                          : it.slicer ? "Excel slicer (its selection as in Tableau)"
                                          : it.control ? controlOutput(it.control.field)
