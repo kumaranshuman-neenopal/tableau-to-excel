@@ -255,7 +255,8 @@ const FORMAT_CONFIG = {
   filterStates: true,             // visuals the slicer formulas cannot rebuild: Tableau's own numbers for each value of each
                                   // dropdown, read at export by setting the filter in Tableau (one filter at a time in Excel)
   filterStatesMaxValues: 60,      // a filter card with more values than this is not read value by value
-  filterStatesMaxReads: 600,      // worksheet reads one export may make for it (values × visuals); beyond, the rest stay fixed
+  filterStatesMaxReads: 1000,     // worksheet reads one export may make for it (values × visuals); beyond, the rest stay fixed
+  filterStatesMaxPairs: 12,       // states of two dropdowns changed at once read (each a Tableau recompute, ~20 s on a big dashboard); 0 = one at a time
   dropdownCards: true,            // a Tableau dropdown card (Multiple Values (dropdown) too) → a dropdown cell, (All) or one value,
                                   // like the card; false: a slicer. A card with several – not all – values selected stays a slicer
   showTiming: false,              // true: also show the "⏱ dashboards … · sheets … · file …" line in the panel (always in the console)
@@ -8764,7 +8765,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-06 363801f2";
+const EXTENSION_BUILD = "2026-11-06 9f89a1df";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -11131,9 +11132,9 @@ const SLICER_REPORT_NOTE = "Slicers: the visuals that follow them compute their 
   `(the hidden "Slicer Data" sheet), so a click in a slicer filters them all; the others keep Tableau's values. Charts and ` +
   "tables keep the bars, points and rows Tableau drew: a value the filter left out at export adds to those, but a category, " +
   "row or line only it has does not appear (export with every value selected to have them all). Visuals that \"follow the " +
-  "dropdowns one at a time\" show Tableau's own numbers, read at export for each value of each dropdown (the hidden \"States\" " +
-  "sheet): they follow one dropdown changed from the export's selection, and show nothing while two are changed, or a slicer or " +
-  "date range is.";
+  "dropdowns\" show Tableau's own numbers, read at export for each value of each dropdown and for pairs of values of two " +
+  "dropdowns (the hidden \"States\" sheet): they follow one or two dropdowns changed from the export's selection, and show " +
+  "nothing for a combination not read (three changed, a pair beyond the limit) or while a slicer or date range is changed.";
 
 const STRATEGY_FILL = { NATIVE: "FFE2F0D9", CONSTRUCTED: "FFDDEBF7", APPROXIMATE: "FFFFF2CC", TABLE_FALLBACK: "FFEDEDED",
                         IMAGE_FALLBACK: "FFE4DFEC", UNSUPPORTED: "FFF8CBAD", FAILED: "FFF4B183" };
@@ -16173,7 +16174,7 @@ async function parameterStateCards(o, visuals) {
       filterValueItems.push(card);
     }
     out.push({ card, kind: "list", field: undefined, choices, current, on: [], affects, raw: { fieldName: p.name }, param: p,
-               ids: [...ids, ...targets.flatMap(t => idsOf(t.param))], targets });
+               ids: [...ids, ...targets.flatMap(t => idsOf(t.param))], ownIds: ids, targets });
     console.log(`[States] parameter "${p.name}": ${choices.length} values, ${affects.length} visual(s) use it` +
                 `${targets.length ? ` (copied into ${targets.map(t => `"${t.param.name}"`).join(", ")} by a parameter action)` : ""}` +
                 `${card.button ? ` (the "${card.button}" button → a dropdown)` : ""}`);
@@ -16267,18 +16268,47 @@ async function addFilterStates(o) {
   }
   const lists = cards.filter(c => c.kind === "list");
   if (!lists.length) return null;
+  // a parameter copied into others by a bridge action (Mes_TMP → Mes): when no visual uses it itself, only the copies are
+  // set – each change makes Tableau recompute the dashboard
+  for (const c of lists) {
+    if (c.param && c.targets.length) c.skipSelf = !c.affects.some(it => sheetUsesParam(o.fmtModel, it.name, c.ownIds));
+    if (c.skipSelf) console.log(`[States] parameter "${c.param.name}": set only through ${c.targets.map(t => `"${t.param.name}"`).join(", ")} (no visual uses it itself)`);
+  }
 
-  // ── read: each value of each dropdown set in Tableau, Tableau's data of the visuals it filters, the filter put back
-  /** state key ("card#|value") → visual name → Tableau's summary data */
+  // ── read: each value of each dropdown set in Tableau, Tableau's data of the visuals it filters, the filter put back;
+  //    then pairs of values of two dropdowns, for the visuals both change
+  /** state key ("card#|value", a pair "a|x||b|y") → visual name → Tableau's summary data */
   const states = new Map();
   const keys = [];
-  let reads = 0, total = lists.reduce((n, c) => n + (c.choices.length - 1) * c.affects.length, 0);
+  /** state key → its dropdowns changed: [card#, value][] */
+  const devsOf = new Map();
+  const SEP = "||";
   const budget = FORMAT_CONFIG.filterStatesMaxReads;
+  let reads = 0, total = Math.min(budget, lists.reduce((n, c) => n + (c.choices.length - 1) * c.affects.length, 0));
+  // the pairs: those that change the most visuals first, up to filterStatesMaxPairs states and the reads' budget
+  const pairs = [];
+  for (let a = 0; a < lists.length; a++) {
+    for (let b = a + 1; b < lists.length; b++) {
+      const shared = lists[a].affects.filter(it => lists[b].affects.includes(it));
+      if (shared.length && (lists[a].param || lists[b].param || lists[a].raw.fieldName !== lists[b].raw.fieldName)) {
+        pairs.push({ a, b, shared, n: (lists[a].choices.length - 1) * (lists[b].choices.length - 1) });
+      }
+    }
+  }
+  pairs.sort((x, y) => y.shared.length - x.shared.length || x.n - y.n);
+  let room = FORMAT_CONFIG.filterStatesMaxPairs;
+  const planned = pairs.filter(p => {
+    if (p.n > room || total + p.n * p.shared.length > budget) return false;
+    room -= p.n;
+    total += p.n * p.shared.length;
+    return true;
+  });
   const valueText = v => (v.value !== null && v.value !== undefined ? v.value : v.formattedValue);
   const setTo = async (c, choice) => {
     if (c.param) {                                             // a parameter's list: its alias / value (and the ones it is copied into)
-      await c.param.changeValueAsync(choice);
-      for (const t of c.targets || []) if (t.choices.includes(choice)) await t.param.changeValueAsync(choice);
+      const to = (c.targets || []).filter(t => t.choices.includes(choice));
+      if (!c.skipSelf || !to.length) { await c.param.changeValueAsync(choice); c.selfSet = true; }
+      for (const t of to) await t.param.changeValueAsync(choice);
       return true;
     }
     const dv = choice === SLICER_ALL ? null : c.valueOf(choice);
@@ -16290,7 +16320,8 @@ async function addFilterStates(o) {
   const restore = async c => {
     if (c.param) {
       const back = (q, v) => (v === null ? Promise.resolve() : q.changeValueAsync(v)).catch(e => console.warn(`[States] parameter "${q.name}" could not be put back: ${e.message}`));
-      await back(c.param, c.current);
+      if (c.selfSet || !c.skipSelf) await back(c.param, c.current);
+      c.selfSet = false;
       for (const t of c.targets || []) await back(t.param, t.current);
       return;
     }
@@ -16299,32 +16330,60 @@ async function addFilterStates(o) {
       : ws.applyFilterAsync(c.raw.fieldName, (f.appliedValues || []).map(valueText), "replace", { isExcludeMode: !!f.isExcludeMode }))
       .catch(e => console.warn(`[States] "${c.raw.fieldName}" on "${ws.name}" could not be put back: ${e.message}`))));
   };
+  const trySet = async (c, choice) => {
+    try { return await setTo(c, choice); } catch (e) { console.warn(`[States] "${c.raw.fieldName}" = ${choice}: ${e.message}`); return false; }
+  };
+  /** Tableau's data of these visuals now, as the state of these changes */
+  const readState = async (devs, affects) => {
+    const got = new Map();
+    await Promise.all(affects.map(async it => {
+      const ws = live.find(w => w.name === it.name);
+      try { got.set(it.name, plainSummary(await ws.getSummaryDataAsync({ ignoreSelection: true }))); } catch (e) { /* left empty: not followed */ }
+      reads++;
+    }));
+    const key = devs.map(([k, v]) => `${k}|${v}`).join(SEP);
+    states.set(key, got);
+    devsOf.set(key, devs);
+    keys.push(key);
+    setExportStatus(`Reading filter values from Tableau — ${reads} of ${total}`);
+  };
   const t0 = performance.now();
   for (const [k, c] of lists.entries()) {
     try {
       for (const choice of c.choices) {
         if (choice === c.current) continue;
         if (reads + c.affects.length > budget) break;
-        const key = `${k}|${choice}`;
-        let set = false;
-        try { set = await setTo(c, choice); } catch (e) { console.warn(`[States] "${c.raw.fieldName}" = ${choice}: ${e.message}`); }
-        if (!set) continue;
-        const got = new Map();
-        await Promise.all(c.affects.map(async it => {
-          const ws = live.find(w => w.name === it.name);
-          try { got.set(it.name, plainSummary(await ws.getSummaryDataAsync({ ignoreSelection: true }))); } catch (e) { /* left empty: not followed */ }
-          reads++;
-        }));
-        states.set(key, got);
-        keys.push(key);
-        setExportStatus(`Reading filter values from Tableau — ${reads} of ${Math.min(total, budget)}`);
+        if (await trySet(c, choice)) await readState([[k, choice]], c.affects);
       }
     } finally {
       await restore(c);
     }
   }
-  console.log(`[States] ${sheetName}: ${keys.length} filter values × ${visuals.length} visual(s) read in ${secs(performance.now() - t0)} (${reads} reads)`);
+  // the pairs: the dropdown with fewer values set once per value (outer), the other run through under it
+  for (const { a, b, shared } of planned) {
+    const [o1, i1] = lists[a].choices.length <= lists[b].choices.length ? [a, b] : [b, a];
+    const outer = lists[o1], inner = lists[i1];
+    try {
+      for (const vo of outer.choices) {
+        if (vo === outer.current || !(await trySet(outer, vo))) continue;
+        try {
+          for (const vi of inner.choices) {
+            if (vi === inner.current || !(await trySet(inner, vi))) continue;
+            await readState([[o1, vo], [i1, vi]].sort((x, y) => x[0] - y[0]), shared);
+          }
+        } finally {
+          await restore(inner);
+        }
+      }
+    } finally {
+      await restore(outer);
+    }
+  }
+  console.log(`[States] ${sheetName}: ${keys.length} filter values (${planned.length} pair(s) of dropdowns) × ${visuals.length} visual(s) ` +
+              `read in ${secs(performance.now() - t0)} (${reads} reads)`);
   if (!keys.length) return null;
+  /** the state a visual is in for a state key: the changes of the dropdowns that filter it ("" = the export's) */
+  const keyFor = (key, it) => devsOf.get(key).filter(([k]) => lists[k].affects.includes(it)).map(([k, v]) => `${k}|${v}`).join(SEP);
 
   // ── the hidden sheet: A1 how many controls differ from the export, A2 the state they make; row 1 the states' keys
   let name = `States ${sheetName}`.slice(0, 31), n = 2;
@@ -16335,6 +16394,18 @@ async function addFilterStates(o) {
   const put = (r, c, v, fmt) => cells.push([r, c, v, fmt]);
   keys.forEach((k, i) => put(1, i + 2, k));
   const K = cellRef(name, 0, 1);
+  // each visual's own key: only the dropdowns that change it (a KPI keeps following Mes × Acumulado while the project
+  // chooser is changed too) – one cell per set of dropdowns, on row 2 (B2, C2 …; finish writes them)
+  /** "0,3" (card numbers) → its key cell */
+  const keyCells = new Map();
+  const keyCellOf = it => {
+    const sig = lists.map((c, k) => (c.affects.includes(it) ? k : -1)).filter(k => k >= 0).join(",");
+    if (!keyCells.has(sig)) {
+      if (keyCells.size >= keys.length) return K;               // more sets than columns of states (never in practice): the shared key
+      keyCells.set(sig, cellRef(name, 1 + keyCells.size, 1));
+    }
+    return keyCells.get(sig);
+  };
   const keyRow = `${cellRef(name, 1, 0, keys.length, 0)}`;
   let slot = 2;                                              // 0-based row of the next value
   // the cards the slicers did not adopt: dropdown cells listing their values (on this sheet, after the states)
@@ -16378,12 +16449,11 @@ async function addFilterStates(o) {
       }
       return viewOf.get(key);
     };
-    const filteredBy = new Set(lists.map((c, k) => (c.affects.includes(it) ? k : -1)).filter(k => k >= 0));
-    /** the value of these rows' measure ci in state key: null = no mark there (or not read) */
+    /** the value of these rows' measure ci in state key: null = no mark there (or a pair not read) */
     const valueIn = (key, rows, ci) => {
       const view = stateView(key);
       const at = view && view.colIx.get(cols[ci].name);
-      if (!view || at === undefined) return undefined;          // not read: unknown
+      if (!view || at === undefined) return key.includes(SEP) ? null : undefined;   // a value not read: unknown
       let sum = null;
       for (const r of rows) {
         for (const m of view.index.get(keyOf(r)) || []) { const v = tfDvNum(m[at]); if (v !== null) sum = (sum || 0) + v; }
@@ -16394,16 +16464,16 @@ async function addFilterStates(o) {
       if (!rows || !rows.length || ci === undefined || !cols[ci] || cols[ci].isHeader || typeof exported !== "number") return null;
       const empty = mode === "chart" ? "NA()" : mode === "zero" ? "0" : '""';
       const values = keys.map(key => {
-        const k = Number(key.split("|")[0]);
-        return filteredBy.has(k) ? valueIn(key, rows, ci) : exported;     // a filter this visual does not have: its value stays
+        const own = keyFor(key, it);
+        return own ? valueIn(own, rows, ci) : exported;               // a filter this visual does not have: its value stays
       });
       if (values.some(v => v === undefined)) return null;
       const r = slot++;
       values.forEach((v, i) => { if (v !== null) put(r + 1, i + 2, v); });
       put(r + 1, 1, it.name);
-      const row = cellRef(name, 1, r, keys.length, r);
-      const look = `INDEX(${row},MATCH(${K},${keyRow},0))`;
-      return `IF(${K}="=",${exported},IFERROR(IF(${look}="",${empty},${look}),${empty}))`;
+      const row = cellRef(name, 1, r, keys.length, r), Ki = keyCellOf(it);
+      const look = `INDEX(${row},MATCH(${Ki},${keyRow},0))`;
+      return `IF(${Ki}="=",${exported},IFERROR(IF(${look}="",${empty},${look}),${empty}))`;
     };
     const sumOf = (rows, ci) => rows.reduce((t, r) => { const v = tfDvNum(r[ci]); return v === null ? t : (t === null ? 0 : t) + v; }, null);
     const binding = {
@@ -16430,7 +16500,7 @@ async function addFilterStates(o) {
     it.vm.slicerBinding = b;
     const pie = it.visualModel.pie;
     if (pie) pie.slicerBinding = b;
-    it.slicerNote = "follows the dropdowns one at a time: Tableau's own numbers for each value, read at export (two changed at once: empty)";
+    it.slicerNote = "follows the dropdowns: Tableau's own numbers for each value and each pair of values read at export (another combination: empty)";
   }
   return {
     /** a gauge whose needle a floated sheet draws: the needle's angle as a formula of the dropdowns – Tableau's angle for
@@ -16440,9 +16510,10 @@ async function addFilterStates(o) {
       if (!n || !gauge.needle || !lists.some(c => c.affects.includes(n.item))) return null;
       const exported = gauge.needle.angle;
       const values = keys.map(key => {
-        if (!lists[Number(key.split("|")[0])].affects.includes(n.item)) return exported;   // that dropdown does not move it
-        const sum = (states.get(key) || new Map()).get(n.item.name);
-        if (!sum) return undefined;
+        const own = keyFor(key, n.item);
+        if (!own) return exported;                                // those dropdowns do not move it
+        const sum = (states.get(own) || new Map()).get(n.item.name);
+        if (!sum) return own.includes(SEP) ? null : undefined;
         const got = gauge.needleOf(layerNeedlePoints(o.fmtModel, n.item.name, sum));
         return got ? got.angle : null;
       });
@@ -16450,9 +16521,9 @@ async function addFilterStates(o) {
       const r = slot++;
       values.forEach((v, i) => { if (v !== null) put(r + 1, i + 2, v); });
       put(r + 1, 1, `${n.item.name} (needle angle)`);
-      const look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${K},${keyRow},0))`;
-      // two dropdowns changed at once (no state Tableau computed): the export's angle
-      return `IF(${K}="=",${exported},IFERROR(IF(${look}="",${exported},${look}),${exported}))`;
+      const Ki = keyCellOf(n.item), look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${Ki},${keyRow},0))`;
+      // a combination not read (no state Tableau computed): the export's angle
+      return `IF(${Ki}="=",${exported},IFERROR(IF(${look}="",${exported},${look}),${exported}))`;
     },
     /** the needle's hover name ("Gauge - NOI Real vs Ppto: -37434.4%") as a formula of the dropdowns: Tableau's tooltip
      * value for each value, read with the needle; null when that sheet was not read */
@@ -16460,9 +16531,10 @@ async function addFilterStates(o) {
       const n = needles.find(x => x.gauge === gauge), tip = gauge.needleTip;
       if (!n || !tip || !lists.some(c => c.affects.includes(n.item))) return null;
       const values = keys.map(key => {
-        if (!lists[Number(key.split("|")[0])].affects.includes(n.item)) return tip.value;
-        const sum = (states.get(key) || new Map()).get(n.item.name);
-        if (!sum) return undefined;
+        const own = keyFor(key, n.item);
+        if (!own) return tip.value;
+        const sum = (states.get(own) || new Map()).get(n.item.name);
+        if (!sum) return own.includes(SEP) ? null : undefined;
         const t = layerTooltip(o.fmtModel, n.item.name, sum);
         return t ? t.value : null;
       });
@@ -16470,20 +16542,24 @@ async function addFilterStates(o) {
       const r = slot++;
       values.forEach((v, i) => { if (v !== null) put(r + 1, i + 2, v); });
       put(r + 1, 1, `${n.item.name} (tooltip)`);
-      const look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${K},${keyRow},0))`;
-      const value = `IF(${K}="=",${tip.value},IFERROR(IF(${look}="",${tip.value},${look}),${tip.value}))`;
+      const Ki = keyCellOf(n.item), look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${Ki},${keyRow},0))`;
+      const value = `IF(${Ki}="=",${tip.value},IFERROR(IF(${look}="",${tip.value},${look}),${tip.value}))`;
       return `${xlText(`${tip.caption}: `)}&TEXT(${value},${xlText(tip.numFmt)})`;
     },
     // the controls are written now: the count of those that differ from the export, and the state the one that does makes
     finish() {
       const flags = [], parts = [];
+      /** card number → its "changed" test and its piece of the key */
+      const byCard = new Map();
       lists.forEach((c, k) => {
         const cell = c.field.control && c.field.control.cell;
         if (!cell) return;
         const flag = `(${cell}<>${xlText(c.current)})`;
         flags.push(flag);
-        parts.push(`IF(${flag},"${k}|"&${cell},"")`);
+        parts.push(`IF(${flag},"${SEP}${k}|"&${cell},"")`);
+        byCard.set(k, { flag, part: parts[parts.length - 1] });
       });
+      const listFlags = flags.length ? flags.join("+") : "0", nList = flags.length;
       cards.filter(c => c.kind !== "list").forEach(c => {
         const ctl = c.card.control && c.card.control.field && c.card.control.field.control;
         if (c.kind === "slicer" && slicers && slicers.active) flags.push(`(SUBTOTAL(103,${slicers.rowRange()})<>${slicers.shownAtExport})`);
@@ -16499,7 +16575,18 @@ async function addFilterStates(o) {
       const S = workbook.addWorksheet(name, { state: "hidden" });
       cells.forEach(([r, c, v, fmt]) => { const cell = S.getCell(r, c); cell.value = v; if (fmt) cell.numFmt = fmt; });
       S.getCell("A1").value = { formula: uniq.length ? uniq.join("+") : "0", result: 0 };
-      S.getCell("A2").value = { formula: `IF(${cellRef(name, 0, 0)}=0,"=",IF(${cellRef(name, 0, 0)}=1,${parts.length ? parts.join("&") : '""'},""))`, result: "=" };
+      // the dropdowns changed (only dropdowns: a slicer changed too has no state read), as the states' keys: "0|Enero||2|Acumulado"
+      const A1 = cellRef(name, 0, 0);
+      S.getCell("A2").value = { formula: `IF(${A1}=0,"=",IF(${A1}=${listFlags},MID(${parts.length ? parts.join("&") : '""'},${SEP.length + 1},999),""))`, result: "=" };
+      // each set of dropdowns' key: "=" while none of them is changed, "" while a slicer or date range is (not read)
+      const others = uniq.filter(x => !flags.slice(0, nList).includes(x));
+      for (const [sig, ref] of keyCells) {
+        const own = sig.split(",").filter(Boolean).map(Number).map(k => byCard.get(k)).filter(Boolean);
+        const changed = own.length ? own.map(x => x.flag).join("+") : "0";
+        const key = own.length ? `MID(${own.map(x => x.part).join("&")},${SEP.length + 1},999)` : '""';
+        const at = ref.slice(ref.lastIndexOf("!") + 1).replace(/\$/g, "");
+        S.getCell(at).value = { formula: `IF(${others.length ? others.join("+") : "0"}>0,"",IF(${changed}=0,"=",${key}))`, result: "=" };
+      }
     }
   };
 }

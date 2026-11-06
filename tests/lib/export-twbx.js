@@ -140,8 +140,12 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
   // SUMMARY=<file.json>: { sheet: { columns, data } } – a sheet's summary data given (a .hyper extract this mock cannot read)
   const given = process.env.SUMMARY ? JSON.parse(fs.readFileSync(process.env.SUMMARY, "utf8")) : {};
   const summary = name => {
-    // "sheet|Parameter=value": that sheet's data while the parameter holds that value (its alias)
-    const byParam = (globalThis.__params || []).map(p => given[`${name}|${p.name}=${p.currentValue && p.currentValue.formattedValue}`]).find(Boolean);
+    // "sheet|Parameter=value[|Parameter=value]": that sheet's data while the parameters hold those values (their aliases);
+    // the key with the most of them wins
+    const holds = cond => { const i = cond.indexOf("="), p = (globalThis.__params || []).find(q => q.name === cond.slice(0, i));
+                            return !!p && p.currentValue && p.currentValue.formattedValue === cond.slice(i + 1); };
+    const byParam = Object.keys(given).filter(k => k.startsWith(`${name}|`)).map(k => k.slice(name.length + 1).split("|"))
+      .filter(conds => conds.every(holds)).sort((x, y) => y.length - x.length).map(conds => given[`${name}|${conds.join("|")}`])[0];
     if (byParam) return { ...byParam, totalRowCount: byParam.data.length };
     if (given[name]) return { ...given[name], totalRowCount: given[name].data.length };
     const sh = model.sheets[name];

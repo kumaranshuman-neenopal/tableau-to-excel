@@ -117,11 +117,15 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
     "Gauge Original NOI (2)": { columns: colsOf(["Segment Color", "Segment ID", "Path Order", "SUM(X)", "SUM(Y)"], ["string", "integer", "integer", "float", "float"]), data: dial },
     "Needle NOI Total NOI": { columns: needleCols, data: needle(30) },
     "Needle NOI Total NOI|Mensual / Acumulado=Acumulado": { columns: needleCols, data: needle(-60) },
+    "Needle NOI Total NOI|Mes=Enero|Mensual / Acumulado=Acumulado": { columns: needleCols, data: needle(-90) },
     "Needle NOI Bolita NOI": { columns: colsOf(["MIN(Bolita)"], ["float"]), data: [[dv(0)]] },
     "Gauge Valor IvE": { columns: colsOf(["MY(Date)", "General - MY Axis", "Measure Names", "Measure Values", "AGG(General - Real Act Seleccionado (G))"], ["string", "string", "string", "float", "float"]), data: ive },
     "Gauge Proyectos Centros Comerciales A": { columns: colsOf([" Proyecto", "Measure Names", "Measure Values", "AGG(MIN(0))"], ["string", "string", "float", "float"]), data: proj }
   }));
   const { log, file } = await exportOf(NOI, "Executive Console", { SUMMARY: given }, "noi.xlsx");
+  // Mes_TMP only feeds Mes (a bridge action): Tableau is set through Mes alone; Mes × Mensual / Acumulado read as pairs
+  assert.match(log, /\[States\] parameter "Mes_TMP": set only through "Mes"/);
+  assert.match(log, /\[States\] Executive Console: \d+ filter values \([1-9]\d* pair\(s\) of dropdowns\)/);
   // the Mensual / Acumulado button → a dropdown; only the visuals whose calculations use the parameter are read
   assert.match(log, /\[States\] parameter "Mensual \/ Acumulado": 2 values, \d+ visual\(s\) use it \(the "Buton A" button → a dropdown\)/);
   assert.doesNotMatch(log, /"PUENTE Param" button/, "a one-mark bridge sheet is not a button");
@@ -134,7 +138,12 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
   assert.match(report, /Needle NOI Bolita NOI.*Worksheet layered on a gauge.*The gauge's centre dot/);
   const states = sheetXml("States Executive Console");
   assert.match(states, /<row r="(\d+)"[^>]*>(?:(?!<\/row>).)*<v>-59\.99\d*<\/v>(?:(?!<\/row>).)*<v>29\.99\d*<\/v>/, "the needle's angle per value: one row");
-  assert.match(sheetXml("Chart Data"), /<f>MAX\(0,MAX\(0,MIN\([^<]*'States Executive Console'!\$A\$2[^<]*<\/f><v>149\.2<\/v>/);
+  // Enero with Acumulado: a state of its own (key "0|Enero||1|Acumulado"), the needle at -90° there; A2 joins the changes
+  assert.match(parts["xl/sharedStrings.xml"] || states, /0\|Enero\|\|1\|Acumulado/);
+  assert.match(states, /<row r="(\d+)"[^>]*>(?:(?!<\/row>).)*<v>-59\.99\d*<\/v>(?:(?!<\/row>).)*<v>-90<\/v>/, "the pair's needle angle on the needle's row");
+  assert.match(states, /<c r="A2"[^>]*><f>[^<]*MID\(/);
+  for (const n of file.sheets) assert.doesNotMatch(sheetXml(n), /<f>IF\(=|MATCH\(,/, `${n}: a formula with an empty key reference`);
+  assert.match(sheetXml("Chart Data"), /<f>MAX\(0,MAX\(0,MIN\([^<]*'States Executive Console'!\$[B-Z]\$2[^<]*<\/f><v>149\.2<\/v>/, "the needle reads its own key cell (its dropdowns only)");
   // the orange panel image: its colour behind the cells
   assert.match(report, /Image\/Backgrounder\.png.*Background image.*Cell fill #FBB05C/);
   assert.match(parts["xl/styles.xml"], /rgb="FFFBB05C"/);
