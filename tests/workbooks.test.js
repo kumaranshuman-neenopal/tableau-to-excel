@@ -123,6 +123,14 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
     "Needle NOI Bolita NOI": { columns: colsOf(["MIN(Bolita)"], ["float"]), data: [[dv(0)]] },
     "Gauge Valor IvE": { columns: colsOf(["MY(Date)", "General - MY Axis", "Measure Names", "Measure Values", "AGG(General - Real Act Seleccionado (G))"], ["string", "string", "string", "float", "float"]), data: ive },
     "Gauge Proyectos Centros Comerciales A": { columns: colsOf([" Proyecto", "Measure Names", "Measure Values", "AGG(MIN(0))"], ["string", "string", "float", "float"]), data: proj },
+    // General: the project groups; Detalle: the projects – other rows, more of them
+    "Gauge Proyectos Mixto A": { columns: colsOf(["Parameter GP / P Mixto", "Measure Names", "Measure Values"], ["string", "string", "float"]),
+      data: ["Capital Reforma", "Paseo Arcos Bosques"].flatMap((p, k) => [[dv(p), dv("Min. Gauge - One"), dv(1)], [dv(p), dv("Gauge - Dynamic Project Chooser Line"), dv([1, -0.5][k])]]) },
+    "Gauge Proyectos Mixto A|Grupo Proyecto / Proyecto=Proyectos": { columns: colsOf(["Parameter GP / P Mixto", "Measure Names", "Measure Values"], ["string", "string", "float"]),
+      data: ["Capital Reforma", "Paseo Arcos Bosques C.C.", "Paseo Arcos Bosques Marco II"].flatMap((p, k) => [[dv(p), dv("Min. Gauge - One"), dv(1)], [dv(p), dv("Gauge - Dynamic Project Chooser Line"), dv([0.3, 1, -2][k])]]) },
+    // the % next to the bars: a measure on Text, nothing on Columns, the columns' field labels hidden
+    "Gauge Proyectos Centros Comerciales B": { columns: colsOf([" Proyecto", "Gauge - Dynamic Project Chooser"], ["string", "float"]),
+                                               data: [[dv("City Walk"), dv(2.43, "243.3%")], [dv("Explanada Pachuca"), dv(-4.68, "-468.4%")]] },
     // the General / Detalle buttons: Text Names labels the marks, Modo Val is what the action sets, EsActivo colours them
     "Button B": { columns: colsOf(["EsActivo", "Modo", "Text Names", "Modo Val", "SUM(X)", "AGG(MIN(1))"], ["bool", "string", "string", "integer", "integer", "integer"]),
                   data: [[dv(true, "True"), dv("Grupo de Proyectos"), dv("General"), dv(1), dv(1), dv(1)],
@@ -160,6 +168,11 @@ test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, o
   // lollipops: thin bars + dots on one scale; the project bars: track and value overlaid, not stacked
   assert.match(report, /Gauge Valor IvE.*Column chart \(thin bars\) with a dot on each/);
   assert.match(report, /Gauge Proyectos Centros Comerciales A.*Overlaid bar chart/);
+  // Detalle changes which rows the Mixto bars have: 3 slots by position, names and values read from the States sheet
+  assert.match(log, /\[States\] Gauge Proyectos Mixto A: 3 rows by position/);
+  assert.match(parts["xl/sharedStrings.xml"], /Gauge Proyectos Mixto A \(row 3\)/);
+  // the % table has no heading over its measure, as in Tableau
+  assert.doesNotMatch(parts["xl/sharedStrings.xml"], /<t[^>]*>Gauge - Dynamic Project Chooser<\/t>/);
   // the light track (Min. Gauge - One: #FFF2E3) behind, the orange value in front; the copy that repeats it is left out
   const bars = Object.entries(parts).find(([n, x]) => /^xl\/charts\/chart\d+\.xml$/.test(n) && /Chooser Line/.test(x))[1];
   const sers = [...bars.matchAll(/<c:ser>.*?<\/c:ser>/gs)].map(m => [(m[0].match(/<c:v>([^<]*)<\/c:v>/) || [])[1], (m[0].match(/srgbClr val="(\w+)"/) || [])[1]]);

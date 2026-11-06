@@ -8774,7 +8774,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-06 81f44b77";
+const EXTENSION_BUILD = "2026-11-06 80b70d67";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -10554,12 +10554,14 @@ function buildViewModel(model, sheetName, summary, opts = {}) {
   }
 
   const labelsRows = fmt.fieldLabelsShown("rows"), labelsCols = fmt.fieldLabelsShown("cols");
+  // a measure on Text with nothing on Columns and the columns' field labels hidden: Tableau shows no heading over it
+  const bareMeasures = !labelsCols && !cols.some(c => c.isHeader && fmt.shelfOf(c.ref) === "cols");
   cols.forEach(c => {
     if (c.pivoted) c.label = c.name;                                          // Measure Names alias
     else if (c.isHeader) {
       const shown = fmt.shelfOf(c.ref) === "cols" ? labelsCols : labelsRows;
       c.label = shown ? fmt.captionFor(c.ref, c.name) : "";
-    } else c.label = fmt.captionFor(c.ref, c.name);
+    } else c.label = bareMeasures ? "" : fmt.captionFor(c.ref, c.name);
     if (c.link && c.link.caption) c.label = c.link.caption;
   });
 
@@ -11357,7 +11359,7 @@ function writeChartData(ws, spec, startRow) {
   // a value that follows the slicers: a formula over the slicer table's visible rows, Tableau's number as its result
   const valueAt = (values, i) => {
     const f = spec.valueFormula ? spec.valueFormula(values, i) : null;
-    return f ? { formula: f, result: values[i] } : values[i];
+    return f ? (num(values[i]) === null ? { formula: f } : { formula: f, result: values[i] }) : values[i];
   };
   ws.getCell(startRow + 1, 1).font = { bold: true };
 
@@ -11463,12 +11465,13 @@ function writeChartData(ws, spec, startRow) {
   const at = (kind, key, i) => `${getExcelColumnName(kind === "series" ? L + /** @type {number} */ (key) : helperCol(String(key)))}${startRow + 2 + i}`;
   for (let i = 0; i < N; i++) {
     if (dates) put(startRow + 1 + i, 0, dates[i], dateFmt);
+    else if (spec.categoryFormula && L === 1) put(startRow + 1 + i, 0, { formula: spec.categoryFormula(i), result: levels[0][i] ?? "" });
     else for (let l = 0; l < L; l++) if (l === L - 1 || starts[l][i]) put(startRow + 1 + i, l, levels[l][i]);
     spec.series.forEach((s, k) => {
       const fmt = s.secondary ? spec.secondaryNumFmt : spec.numFmt;
       const f = s.cellFormula ? s.cellFormula(i, at) : null;
       if (f) put(startRow + 1 + i, L + k, num(s.values[i]) === null ? { formula: f } : { formula: f, result: s.values[i] }, fmt);
-      else if (num(s.values[i]) !== null) put(startRow + 1 + i, L + k, valueAt(s.values, i), fmt);
+      else if (num(s.values[i]) !== null || spec.categoryFormula) put(startRow + 1 + i, L + k, valueAt(s.values, i), fmt);   // a slot by position: its formula even when empty now
     });
   }
   // label texts taken from cells (Excel's "Value From Cells"), after the series columns
@@ -16561,8 +16564,49 @@ async function addFilterStates(o) {
         const f = src ? formula(src.rows[i], src.ci, "chart", values[i]) : null;
         if (f) binding.written++; else binding.fixed++;
         return f;
-      }
+      },
+      positional: () => positional
     };
+    // a dropdown that changes which rows there are (General: the project groups, Detalle: the projects): slot k shows
+    // the k-th row Tableau gave for the state – its name and its values – and nothing past the last; null when every
+    // state has the export's rows (found by name, as above), the view has more than one dimension, or a state is unread
+    const positional = (() => {
+      if (pie || heads.length !== 1) return null;
+      const exportKeys = new Set(vm.rows.map(keyOf));
+      const lists = keys.map(key => { const own = keyFor(key, it); return own ? stateView(own) : "export"; });
+      if (lists.some(v => v === null)) return null;
+      if (!lists.some(v => v !== "export" && [...v.index.keys()].some(k => !exportKeys.has(k)))) return null;
+      const slotsOf = v => (v === "export" ? null : [...v.index.keys()]);
+      const n = Math.max(exportKeys.size, ...lists.map(v => (v === "export" ? 0 : v.index.size)));
+      if (n > FORMAT_CONFIG.filterStatesMaxValues * 4) return null;
+      const rowFor = (cells, label, exported, empty) => {
+        const r = slot++;
+        cells.forEach((v, j) => { if (v !== null && v !== undefined) put(r + 1, j + 2, v); });
+        put(r + 1, 1, `${it.name} (${label})`);
+        const look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${keyCellOf(it)},${keyRow},0))`;
+        return `IF(${keyCellOf(it)}="=",${exported},IFERROR(IF(${look}="",${empty},${look}),${empty}))`;
+      };
+      return {
+        n,
+        /** slot i's name: the export's own in the export's state */
+        label(i, exported) {
+          const cells = lists.map(v => (v === "export" ? exported : (slotsOf(v)[i] ?? null)));
+          return `${rowFor(cells, `row ${i + 1}`, xlText(exported ?? ""), '""')}&""`;
+        },
+        /** slot i's value of measure ci: the export's own value in the export's state */
+        value(i, ci, exported) {
+          const at = cols[ci] && !cols[ci].isHeader ? cols[ci].name : null;
+          if (!at) return null;
+          const cells = lists.map(v => {
+            if (v === "export") return typeof exported === "number" ? exported : null;
+            const k = slotsOf(v)[i], c = v.colIx.get(at);
+            if (k === undefined || c === undefined) return null;
+            return v.index.get(k).reduce((t, r) => { const x = tfDvNum(r[c]); return x === null ? t : (t ?? 0) + x; }, null);
+          });
+          return rowFor(cells, `row ${i + 1} ${at}`, typeof exported === "number" ? exported : "NA()", "NA()");
+        }
+      };
+    })();
     return binding;
   };
   for (const it of visuals) {
@@ -17755,6 +17799,24 @@ setTableVisibleRows(placedItems);
         // a 100 % stacked chart without value labels: Excel draws each stack's shares itself from the base measure
         const shares = !!spec.percent && !spec.series.some(s => s.labels || s.labelTexts);
         spec.valueFormula = shares ? (values, i) => binding.valueFormula(values, i, true) : binding.valueFormula;
+        // a dropdown that changes which rows there are: the categories and values by position (slot k = Tableau's k-th
+        // row for the values picked), as many slots as the longest state – a shorter one leaves the rest blank
+        const pos = binding.positional && binding.positional();
+        const cats = spec.categories && spec.categories.levels;
+        if (pos && cats && cats.length === 1 && !spec.dateAxis && !shares && /^(bar|line|combo)$/.test(spec.kind) &&
+            spec.series.every(s => s.values && /** @type {any} */ (s.values).src)) {
+          const n0 = cats[0].length, ciOf = s => /** @type {any} */ (s.values).src.ci;
+          for (let i = n0; i < pos.n; i++) { cats[0].push(""); spec.series.forEach(s => s.values.push(null)); }
+          spec.categoryFormula = i => pos.label(i, i < n0 ? String(cats[0][i] ?? "") : "");
+          const own = new Map(spec.series.map(s => [s.values, ciOf(s)]));
+          spec.valueFormula = (values, i) => {
+            const f = own.has(values) ? pos.value(i, own.get(values), i < n0 ? values[i] : null) : null;
+            if (f) binding.written++;
+            return f;
+          };
+          spec.keepNames = true;
+          console.log(`[States] ${item.name}: ${pos.n} rows by position (a dropdown changes which rows there are)`);
+        }
         // a waterfall's bars are computed from its steps (cells of its own), not taken from the marks
         if (/** @type {any} */ (spec).waterfall && bindWaterfall(spec, item.vm.slicerBinding)) {
           spec.valueFormula = undefined;
