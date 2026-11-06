@@ -140,6 +140,9 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
   // SUMMARY=<file.json>: { sheet: { columns, data } } – a sheet's summary data given (a .hyper extract this mock cannot read)
   const given = process.env.SUMMARY ? JSON.parse(fs.readFileSync(process.env.SUMMARY, "utf8")) : {};
   const summary = name => {
+    // "sheet|Parameter=value": that sheet's data while the parameter holds that value (its alias)
+    const byParam = (globalThis.__params || []).map(p => given[`${name}|${p.name}=${p.currentValue && p.currentValue.formattedValue}`]).find(Boolean);
+    if (byParam) return { ...byParam, totalRowCount: byParam.data.length };
     if (given[name]) return { ...given[name], totalRowCount: given[name].data.length };
     const sh = model.sheets[name];
     if (!sh) return { columns: [], data: [] };
@@ -282,9 +285,25 @@ const AGG = { sum: "SUM", avg: "AVG", min: "MIN", max: "MAX", cnt: "CNT", ctd: "
   const params = Object.entries(model.fields).filter(([k, f]) => /^Parameters\|/.test(k) && f.param).map(([, f]) => {
     const raw = String(f.value ?? "").replace(/^"|"$/g, ""), num = /^(real|integer|float|int)$/i.test(f.datatype || "") ? Number(raw) : NaN;
     const nf = isFinite(num) && f.defaultFormat ? T.tableauToExcelNumFmt(f.defaultFormat) : null;
-    return { id: `[Parameters].[${f.name}]`, name: f.caption || f.name, dataType: f.datatype,
-             currentValue: isFinite(num) ? { value: String(num), nativeValue: num, formattedValue: nf ? T.tfFormatNumber(num, nf) : String(num) } : dv(raw) };
+    // a list parameter's members (alias = the text Tableau shows); changeValueAsync takes that text, as the API does
+    const col = Array.from(doc.getElementsByTagName("column")).find(c => c.getAttribute("name") === `[${f.name}]` && c.getAttribute("param-domain-type"));
+    const members = col && col.getAttribute("param-domain-type") === "list"
+      ? Array.from(col.getElementsByTagName("member")).map(m => { const v = String(m.getAttribute("value") || "").replace(/^"|"$/g, ""); return dv(v, m.getAttribute("alias") || v); }) : [];
+    const p = { id: `[Parameters].[${f.name}]`, name: f.caption || f.name, dataType: f.datatype,
+                currentValue: isFinite(num) ? { value: String(num), nativeValue: num, formattedValue: nf ? T.tfFormatNumber(num, nf) : String(num) } : dv(raw),
+                allowableValues: { type: members.length ? "list" : "all", allowableValues: members } };
+    const shown = members.find(m => Number(m.value) === num || m.value === raw);
+    if (shown) p.currentValue = shown;
+    if (members.length) p.changeValueAsync = async text => {
+      const m = members.find(x => x.formattedValue === String(text));
+      if (!m) throw new Error(`"${text}" is not in the list`);
+      globalThis.__paramSets = (globalThis.__paramSets || 0) + 1;
+      p.currentValue = m;
+      return m;
+    };
+    return p;
   });
+  globalThis.__params = params;
   return { name: DNAME, objects, worksheets, getParametersAsync: async () => params };
   };
   const names0 = ALL ? Object.keys(model.dashboards) : [DASH];

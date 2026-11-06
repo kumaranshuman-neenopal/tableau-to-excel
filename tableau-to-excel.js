@@ -1710,11 +1710,17 @@ function tfZoneStyle(el) {
   if (!el) return undefined;
   const f = {};
   tfKids(el, "format").forEach(x => { f[x.getAttribute("attr")] = x.getAttribute("value"); });
+  // Layout → Outer padding (px): the zone's background is painted inside it ("margin" for all sides, "margin-top" …
+  // for one) – a 35 px high zone with 16 + 17 px of it is a 2 px line
+  const m = tfNum(f.margin) || 0;
+  const side = s => (f[`margin-${s}`] !== undefined ? tfNum(f[`margin-${s}`]) || 0 : m);
+  const margin = Object.keys(f).some(k => /^margin/.test(k)) ? { t: side("top"), r: side("right"), b: side("bottom"), l: side("left") } : undefined;
   const style = tfDefined({
     bgColor: tfArgb(f["background-color"]) || undefined,
     borderColor: tfArgb(f["border-color"]) || undefined,
     borderStyle: f["border-style"] || undefined,
-    borderWidth: tfNum(f["border-width"])
+    borderWidth: tfNum(f["border-width"]),
+    margin
   });
   return Object.keys(style).length ? style : undefined;
 }
@@ -2785,16 +2791,19 @@ function resolveVisualMarks(spec, vm, model) {
 
 /**
  * Rounded bars: a line from a constant (MIN(0)) to each value, one per member, drawn thick with round caps –
- * Line mark, Measure Names on Path, the constant among Measure Values.
+ * Line mark, Measure Names on Path, the constant among Measure Values. Circles / shapes on the same axis make a
+ * barbell; on an axis of their own (dual axis) they are a lollipop's heads over the rounded bars.
  * @param {ViewModel} vm @param {FormatModel | null} model
  */
 function isRoundedBar(vm, model) {
   const sheet = vm.fmt && vm.fmt.sheetModel;
   if (!sheet) return false;
-  const path = sheet.panes.some(p => /^line$/i.test(p.markClass || "") && p.encodings.some(e => e.channel === "path" && e.field.name === "Measure Names"));
+  const axisOf = p => p.yAxisName || p.xAxisName || null;
+  const lines = sheet.panes.filter(p => /^line$/i.test(p.markClass || "") && p.encodings.some(e => e.channel === "path" && e.field.name === "Measure Names"));
   const mv = [...sheet.rows, ...sheet.cols].some(r => r.name === "Multiple Values");
-  const circles = sheet.panes.some(p => /^(circle|shape)$/i.test(p.markClass || ""));
-  return path && mv && !circles && sheet.fieldRefs.some(r => tvIsConstantRef(model, r));
+  const dots = sheet.panes.filter(p => /^(circle|shape)$/i.test(p.markClass || ""));
+  const heads = dots.every(p => axisOf(p) && !lines.some(l => axisOf(l) === axisOf(p)));
+  return !!lines.length && mv && heads && sheet.fieldRefs.some(r => tvIsConstantRef(model, r));
 }
 
 /**
@@ -3035,14 +3044,69 @@ function tvCartesianSpecs(ctx) {
                                 pointColors: s.pointColors ? s.pointColors.map((c, i) => i >= r.from && i <= r.to ? c : null) : undefined })));
   };
 
+  // a shape pane over the line (ctx.decor): the line in its own colour, a dot where the Shape field picks a shape
+  // (Custom/Null.png = none) in the pane's colour for that mark, the pane's label text there
+  // ponytail: the dots' and labels' places are the export's – the line's values follow the dropdowns
+  const decorate = s => {
+    const d = ctx.decor, p = d.pane, fmt = vm.fmt;
+    const ciOf = ref => (ref ? vm.cols.findIndex(c => c.ref && tfSameField(c.ref, ref)) : -1);
+    const encOf = ch => (p.encodings.find(e => e.channel === ch) || {}).field || null;
+    const shapeRef = encOf("shape"), si = ciOf(shapeRef), ti = ciOf(encOf("text") || encOf("label")), coli = ciOf(encOf("color"));
+    const firstOf = ci => {
+      const out = new Array(cats.count).fill(null);
+      if (ci >= 0) vm.rows.forEach(r => { const i = cats.indexOf(r); if (i >= 0 && out[i] === null && !tfIsNull(r[ci])) out[i] = r[ci]; });
+      return out;
+    };
+    const shapes = firstOf(si), texts = firstOf(ti), colours = firstOf(coli);
+    const map = shapeRef && si >= 0 ? fmt.shapeMap(shapeRef) : null;
+    let enc = null, scale = null;
+    try {
+      enc = coli >= 0 ? fmt.colorEncodingOf(p) : null;
+      const key = v => (enc.continuous ? tfDvNum(v) : tfDvText(v));
+      if (enc) scale = tfBuildColorScale(fmt, enc, colours.filter(v => v !== null).map(key));
+      if (scale) { const sc = scale; scale = v => sc(key(v)); }
+    } catch (e) { scale = null; }
+    const dot = i => (scale && colours[i] !== null && scale(colours[i])) ? tvHex(scale(colours[i])) : d.lineColor || s.color;
+    // a value the map has no shape for gets Tableau's default (a circle); "…Null.png" draws nothing
+    const shown = i => {
+      if (num(s.values[i]) === null) return false;
+      const sh = map && shapes[i] !== null ? map[tfBucketKey(tfDvText(shapes[i]))] : null;
+      return !sh || !/null\.png$/i.test(sh);
+    };
+    const out = { ...s, color: d.lineColor || s.color, pointColors: undefined, markerSize: 6,
+                  pointMarkers: s.values.map((v, i) => (shown(i) ? dot(i) : null)) };
+    if (ti >= 0 && texts.some(v => v !== null && tfDvText(v).trim())) {
+      out.labels = true;
+      out.labelTexts = texts.map(v => (v === null ? "" : tfDvText(v)));
+    }
+    return out;
+  };
+  const decorLabelFont = () => {
+    const p = ctx.decor.pane;
+    const c = tfArgb(tvPaneRule(p, "datalabel", "color")), size = Number(tvPaneRule(p, "datalabel", "font-size"));
+    const bold = /bold/i.test(String(tvPaneRule(p, "datalabel", "font-weight") || ""));
+    return c || size ? { color: c ? c.slice(2) : undefined, size: size || undefined, bold } : null;
+  };
+
   // stacked bars / areas of a "% of Total" that fills every category: Excel's 100% stacked chart
   const percentOfTotal = measures.length > 0 && measures.every(m => isPercentOfTotal(m.ref));
   const make = (series, extra) => {
+    if (ctx.decor) series = series.map(s => ((s.type || "") === "line" && !s.refLine && !s.secondary ? decorate(s) : s));
     if (series.length > TV_MAX_SERIES) throw new Error(`${series.length} series – too many for an Excel chart`);
     const kinds = new Set(series.map(s => s.type));
     const kind = kinds.size > 1 || series.some(s => s.secondary) ? "combo" : ([...kinds][0] || "bar");
     const stackable = series.every(s => s.type === "bar" || s.type === "area");
-    const stacked = stackable && series.length > 1 && !ctx.clustered &&
+    // rounded bars all start at the constant: Tableau draws them over each other (a track behind its value), never
+    // stacked – Excel's 100% overlap: a track (a constant, the same length everywhere) behind, then the longest
+    // first so each shorter one stays in front
+    const overlaid = ctx.roundedBar && mvMode && series.length > 1 && series.every(s => s.type === "bar" && !s.secondary);
+    if (overlaid) {
+      const vals = s => (s.values || []).filter(v => v !== null && v !== undefined);
+      const track = s => { const v = vals(s); return v.length > 1 && v.every(x => x === v[0]); };
+      const len = s => Math.max(0, ...vals(s).map(Math.abs));
+      series = [...series].sort((a, b) => (track(b) - track(a)) || len(b) - len(a));
+    }
+    const stacked = !overlaid && stackable && series.length > 1 && !ctx.clustered &&
       ((colorCi >= 0 && colorLevel < 0) || (mvMode && color && color.measureNames && roles.measureNames !== catShelf));
     const totals = Array.from({ length: cats.count }, (_, i) => series.reduce((a, s) => a + ((s.values && s.values[i]) || 0), 0));
     const percent = stacked && percentOfTotal && totals.some(t => t) && totals.every(t => t === 0 || Math.abs(t - 1) < 0.005);
@@ -3050,11 +3114,13 @@ function tvCartesianSpecs(ctx) {
     // bottom → reversed (bars across keep the legend's order from the axis outwards)
     const ordered = paneBreaks(stacked && !horizontal ? [...series].reverse() : series);
     const spec = { ...tvBaseSpec(vm), kind, barDir: horizontal ? "bar" : "col", stacked,
-                   categories, categoryTitle, legend: series.length > 1, series: ordered, ...(dateAxis ? { dateAxis } : {}), ...extra };
+                   categories, categoryTitle, legend: series.length > 1, series: ordered, ...(overlaid ? { overlap: true } : {}),
+                   ...(dateAxis ? { dateAxis } : {}), ...extra };
     if (percent) {
       spec.percent = true;
       if (!/%/.test(spec.numFmt || "")) spec.numFmt = "0%";
     }
+    if (ctx.decor && series.some(s => s.labelTexts) && !spec.labelFont) { const lf = decorLabelFont(); if (lf) spec.labelFont = lf; }
     return spec;
   };
 
@@ -3083,7 +3149,19 @@ function tvCartesianSpecs(ctx) {
     const decorative = axisIds.filter(k => { const p = paneOfAxis(k); return p && tvMarkToken(p.markClass) === "shape" && p.encodings.some(e => e.channel === "shape"); });
     if (decorative.length && decorative.length < axisIds.length) {
       const keep = measures.filter(m => !decorative.includes(m.axis || 0));
-      if (keep.length) { measures.splice(0, measures.length, ...keep); return tvCartesianSpecs({ ...ctx, roles: { ...roles, [valueShelf]: { ...roles[valueShelf], values: keep } } }); }
+      if (keep.length) {
+        // the same measure's shapes over its line (a dot and a label on the first / last / max month): drawn on the
+        // line as markers where the Shape field picks a shape, with the pane's label text – its Color belongs to them,
+        // not to the line, which keeps its own pane's colour
+        const deco = paneOfAxis(decorative[0]);
+        const same = measures.some(m => decorative.includes(m.axis || 0) && keep.some(x => x.ci === m.ci));
+        const decoColor = !!deco && deco.encodings.some(e => e.channel === "color");
+        const otherColor = roles.panes.some(p => p !== deco && p.encodings.some(e => e.channel === "color"));
+        const decor = same && deco ? { pane: deco, lineColor: paneColor(keep[0], 0) } : ctx.decor;
+        measures.splice(0, measures.length, ...keep);
+        return tvCartesianSpecs({ ...ctx, decor, roles: { ...roles, ...(same && decoColor && !otherColor ? { color: null } : {}),
+                                                          [valueShelf]: { ...roles[valueShelf], values: keep } } });
+      }
     }
   }
 
@@ -3174,6 +3252,26 @@ function tvCartesianSpecs(ctx) {
       }));
     });
     const first = groupOf(axisIds[0])[0], second = groupOf(axisIds[1])[0];
+    // rounded bars with a dot of their own measure on the other axis: a lollipop – thin bars, each dot on one scale
+    // with them when Tableau synchronizes the axes
+    const dotted = series.filter(s => s.secondary && s.line === false && s.marker);
+    if (ctx.roundedBar && !horizontal && dotted.length && series.every(s => s.secondary ? dotted.includes(s) : s.type === "bar")) {
+      // the bars in their marks card's colour, thick like Tableau's round-capped lines; each dot a white ring of it
+      const barColor = paneColor(first, 0);
+      series.forEach(s => { if (!s.secondary && !(color && color.measureNames)) s.color = barColor; });
+      // each dot a white ring of the bar's colour – Tableau's coin shape drawn natively (no picture)
+      dotted.forEach(s => { s.markerSize = 11; s.color = s.color && color && color.measureNames ? s.color : barColor; s.markerFill = "FFFFFF"; });
+      // Synchronize Axis is stored on the shelf's axis field (as Tableau names it there), not the measure's own ref.
+      // Synchronized: the dots simply share the bars' axis – one scale however the values change with a dropdown
+      const axisRef = (roles[valueShelf].axisRefs || [])[1] || second.ref;
+      const synced2 = [axisRef, second.ref].some(r => r && vm.fmt.axisSpace(r, valueShelf, "0").synchronized);
+      if (synced2) dotted.forEach(s => { s.secondary = false; });
+      const spec = make(series, { numFmt: tvNumFmt(vm, first.ci), gapWidth: 150, valueTitle: tvMeasureLabel(vm, first.ci) });
+      spec.stacked = false;
+      spec.legend = false;
+      spec.conversion = lollipopConversion(false);
+      return [spec];
+    }
     const spec = make(series, { numFmt: tvNumFmt(vm, first.ci), valueTitle: groupOf(axisIds[0]).length === 1 ? tvMeasureLabel(vm, first.ci) : "Value",
                                 secondaryNumFmt: tvNumFmt(vm, second.ci), secondaryTitle: groupOf(axisIds[1]).length === 1 ? tvMeasureLabel(vm, second.ci) : "Value" });
     spec.stacked = false;
@@ -4422,6 +4520,69 @@ function buildHoleSpec(fmt, pie) {
 }
 
 /**
+ * Sheets floated on a gauge's dial to finish it (a needle sheet, a centre-dot sheet): worksheet zones whose centre
+ * lies inside the dial's zone and that are not much bigger. A needle: a polygon / line sheet of 2–8 marks whose
+ * points are its axis values (in path order); a dot: a circle / shape sheet of one mark.
+ * dataOf(sheetName) → that sheet's summary data.
+ * @returns {{ needle: { name: string, pts: number[][], color: string } | null, dots: string[] }}
+ */
+function gaugeLayers(model, dashName, dialSheet, dataOf) {
+  const out = { needle: null, dots: [] };
+  const dash = model && model.dashboards && model.dashboards[dashName];
+  const z = dash && dash.zones.find(s => s.type === "worksheet" && s.name === dialSheet && !s.hidden);
+  if (!z || !z.w || !z.h) return out;
+  const inside = c => { const x = c.x + c.w / 2, y = c.y + c.h / 2; return x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h; };
+  dash.zones.filter(c => c !== z && c.type === "worksheet" && c.name && c.name !== dialSheet && !c.hidden && c.w && c.h &&
+                         c.w * c.h <= 1.2 * z.w * z.h && inside(c)).forEach(c => {
+    const sheet = model.sheets[c.name], sum = dataOf(c.name);
+    if (!sheet || !sum || !sum.data) return;
+    const panes = (sheet.panes || []).filter(p => p.encodings && !p.hidden);
+    const marks = panes.map(p => String(p.markClass || "").toLowerCase());
+    if (sum.data.length <= 1 && marks.length && marks.every(m => /^(circle|shape|automatic)$/.test(m)) && marks.some(m => m !== "automatic")) { out.dots.push(c.name); return; }
+    const pane = panes.find(p => /^(polygon|line)$/i.test(p.markClass || ""));
+    if (out.needle || !pane) return;
+    const pts = layerNeedlePoints(model, c.name, sum);
+    if (pts) out.needle = { name: c.name, pts, color: createSheetFormatter(model, c.name, [pane]).markColor(), tip: layerTooltip(model, c.name, sum) };
+  });
+  return out;
+}
+
+/** a needle sheet's tooltip number (its first measure on Tooltip, the same on every mark): caption, value, Excel
+ * format – the gauge's hover text ("Gauge - NOI Real vs Ppto: -37434.4%"); null: none
+ * @param {FormatModel} model @param {string} sheetName @param {any} sum its summary data */
+function layerTooltip(model, sheetName, sum) {
+  const sheet = model.sheets[sheetName];
+  if (!sheet || !sum || !sum.data || !sum.data.length) return null;
+  const f = createSheetFormatter(model, sheetName);
+  const refs = (sum.columns || []).map(k => /:(qk|nk|ok)(:\d+)?\]$/.test(k.fieldId || "") ? tfParseFieldRef(k.fieldId) : f.matchName(k.fieldName));
+  for (const e of (sheet.panes || []).flatMap(p => (p.encodings || []).filter(x => x.channel === "tooltip"))) {
+    const ci = refs.findIndex(r => r && tfSameField(r, e.field));
+    const row = ci >= 0 ? sum.data.find(r => tfDvNum(r[ci]) !== null) : null;
+    if (!row) continue;
+    const numFmt = f.numFmtFor(e.field) || inferExcelNumFmt(tfDvText(row[ci]), tfDvNum(row[ci])) || "General";
+    return { ref: e.field, caption: f.captionFor(e.field, e.field.name), value: tfDvNum(row[ci]), text: tfDvText(row[ci]), numFmt };
+  }
+  return null;
+}
+
+/** a needle sheet's outline: its marks' axis values (Columns, Rows) in path order; null: not 2–8 marks
+ * @param {FormatModel} model @param {string} sheetName @param {any} sum its summary data */
+function layerNeedlePoints(model, sheetName, sum) {
+  const sheet = model.sheets[sheetName];
+  const pane = sheet && (sheet.panes || []).find(p => p.encodings && !p.hidden && /^(polygon|line)$/i.test(p.markClass || ""));
+  if (!pane || !sum || !sum.data || sum.data.length < 2 || sum.data.length > 8) return null;
+  const f = createSheetFormatter(model, sheetName);
+  const refs = (sum.columns || []).map(k => /:(qk|nk|ok)(:\d+)?\]$/.test(k.fieldId || "") ? tfParseFieldRef(k.fieldId) : f.matchName(k.fieldName));
+  const colOf = r => r ? refs.findIndex(x => x && tfSameField(x, r)) : -1;
+  const xi = colOf((sheet.cols || []).find(r => r.type === "qk")), yi = colOf((sheet.rows || []).find(r => r.type === "qk"));
+  if (xi < 0 || yi < 0) return null;
+  const pi = colOf((pane.encodings.find(e => e.channel === "path") || {}).field);
+  const rows = sum.data.filter(r => tfDvNum(r[xi]) !== null && tfDvNum(r[yi]) !== null);
+  if (pi >= 0) rows.sort((a, b) => (tfDvNum(a[pi]) || 0) - (tfDvNum(b[pi]) || 0));
+  return rows.length >= 2 ? rows.map(r => [tfDvNum(r[xi]), tfDvNum(r[yi])]) : null;
+}
+
+/**
  * Floating centre text: a dashboard text box, or another sheet (e.g. a total), whose centre lies inside a single
  * donut's hole (or a pie's circle) is drawn there with its Tableau text and fonts.
  * g: { stretch, D, holeD, cell, margin } px; dataOf(sheetName) → that sheet's summary data.
@@ -5557,6 +5718,26 @@ function buildMapGaugeModel(model, sheetName, summary) {
     };
     return {
       kind: "map", start, span, bands, holeRatio: r0 / R, needle, hub, texts,
+      /** a needle drawn by another sheet floated on this one (its outline's points, in that sheet's own units):
+       * the tip is the point farthest from the others' middle – its angle from there, so that sheet's axes need not
+       * match this one's – its length relative to this dial's radius */
+      withNeedle(pts, color) {
+        const n = this.needleOf(pts);
+        if (!n) return false;
+        this.needle = { angle: n.angle, length: Math.min(1, Math.max(0.3, n.len / R)), color: String(color || "333333").toUpperCase() };
+        tfLog(`Gauge (map): needle from a layered sheet at ${n.angle.toFixed(1)}°`);
+        return true;
+      },
+      /** such a needle's angle in this dial's frame (and its length in its own units); null: no tip */
+      needleOf(pts) {
+        if (!pts || pts.length < 2) return null;
+        const far = i => { const o = pts.filter((p, k) => k !== i); const m = [o.reduce((a, p) => a + p[0], 0) / o.length, o.reduce((a, p) => a + p[1], 0) / o.length];
+                           return { d: Math.hypot(pts[i][0] - m[0], pts[i][1] - m[1]), m }; };
+        let best = -1, base = null, len = 0;
+        pts.forEach((p, i) => { const f = far(i); if (f.d > len) { len = f.d; best = i; base = f.m; } });
+        if (best < 0 || !(len > 0)) return null;
+        return { angle: wrap(tfGaugeAngle(pts[best][0], pts[best][1], { cx: base[0], cy: base[1] })), len };
+      },
       /** the dial's band ends (each band's To; the first band's From) and the needle as formulas of the parameter
        * cells – a number where nothing moves it; null when no angle follows a cell */
       live: paramCell => {
@@ -5615,6 +5796,8 @@ function writeGaugeData(ds, startRow, gauge, name, live) {
     ds.getCell(row, 1).value = "Needle"; ds.getCell(row, 1).font = { bold: true };
     const f = ++row;
     nd.forEach(s => { ds.getCell(row, 1).value = s.name; ds.getCell(row, 2).value = s.value; row++; });
+    // the hover name with Tableau's tooltip value for the dropdowns' current value
+    if (live && live.needleTip) ds.getCell(f + 1, 1).value = { formula: live.needleTip, result: nd[1].name };
     if (live && live.needle) {                                 // gaugeNeedleSlices's wedges, of the needle's formula
       const w = nd[1].value, span = lastTo || String(gauge.span);
       ds.getCell(f, 2).value = { formula: `MAX(0,MAX(0,MIN(${span},${rel(live.needle)}))-${w / 2})`, result: nd[0].value };
@@ -5643,9 +5826,11 @@ function gaugeNeedleSlices(gauge) {
   const w = 1.6;                                               // degrees: a thin but visible needle
   const at = Math.max(0, Math.min(gauge.span, gauge.needle.angle - gauge.start));
   const before = Math.max(0, at - w / 2);
-  return [{ name: "Before the needle", value: +before.toFixed(4) },
-          { name: "Needle", value: w },
-          { name: "After the needle", value: +(360 - before - w).toFixed(4) }];
+  // the slices' names are what Excel shows on hover: the needle its Tableau tooltip, the see-through rest nothing
+  const tip = gauge.needleTip;
+  return [{ name: " ", value: +before.toFixed(4) },
+          { name: tip ? `${tip.caption}: ${tip.text}` : "Needle", value: w },
+          { name: "  ", value: +(360 - before - w).toFixed(4) }];
 }
 
 /**
@@ -6709,6 +6894,132 @@ function imageInfo(data, path = "") {
 }
 
 /**
+ * The colour most of a PNG's opaque pixels have (a background panel's fill): ARGB, null when it is not an 8-bit
+ * PNG or cannot be read. Pixels are counted in 4-bit-per-channel buckets; the top bucket's average is returned.
+ * ponytail: PNG only (backdrops are PNG in practice); JPEG / SVG backdrops stay unexported – a canvas would read them.
+ * @param {Uint8Array} data @returns {Promise<string | null>}
+ */
+async function pngDominantColor(data) {
+  const img = await pngPixels(data);
+  if (!img) return null;
+  const { w, h, rgba } = img;
+  const buckets = new Map();
+  const step = Math.max(1, Math.floor(w * h / 40000));         // ~40k samples are plenty for a fill colour
+  for (let k = 0; k < w * h; k += step) {
+    const o = k * 4, r = rgba[o], g = rgba[o + 1], bl = rgba[o + 2];
+    if (rgba[o + 3] < 128) continue;
+    const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (bl >> 4);
+    const s = buckets.get(key) || buckets.set(key, [0, 0, 0, 0]).get(key);
+    s[0]++; s[1] += r; s[2] += g; s[3] += bl;
+  }
+  let top = null;
+  buckets.forEach(s => { if (!top || s[0] > top[0]) top = s; });
+  if (!top) return null;
+  const hex = v => Math.round(v / top[0]).toString(16).padStart(2, "0");
+  return `FF${hex(top[1])}${hex(top[2])}${hex(top[3])}`.toUpperCase();
+}
+
+/**
+ * An 8-bit, non-interlaced PNG's pixels as RGBA (palette, grey, grey+alpha, RGB, RGBA); null when it is anything
+ * else or cannot be read. Inflates with the platform's DecompressionStream.
+ * @param {Uint8Array} data @returns {Promise<{ w: number, h: number, rgba: Uint8Array } | null>}
+ */
+async function pngPixels(data) {
+  try {
+    const b = data || new Uint8Array(0);
+    if (imageInfo(b).type !== "png" || typeof DecompressionStream !== "function") return null;
+    const u32 = i => ((b[i] << 24) >>> 0) + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
+    let w = 0, h = 0, depth = 0, ctype = 0, interlace = 0, plte = null, trns = null;
+    const idat = [];
+    for (let i = 8; i + 8 <= b.length;) {
+      const len = u32(i), type = String.fromCharCode(b[i + 4], b[i + 5], b[i + 6], b[i + 7]), body = b.subarray(i + 8, i + 8 + len);
+      if (type === "IHDR") { w = u32(i + 8); h = u32(i + 12); depth = body[8]; ctype = body[9]; interlace = body[12]; }
+      else if (type === "PLTE") plte = body;
+      else if (type === "tRNS") trns = body;
+      else if (type === "IDAT") idat.push(body);
+      else if (type === "IEND") break;
+      i += 12 + len;
+    }
+    const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[ctype];
+    if (depth !== 8 || !channels || interlace || !w || !h || !idat.length) return null;
+    const raw = new Uint8Array(await new Response(new Blob(idat).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+    const stride = w * channels, px = new Uint8Array(stride * h);
+    for (let y = 0; y < h; y++) {                              // PNG filters: None, Sub, Up, Average, Paeth
+      const f = raw[y * (stride + 1)], src = y * (stride + 1) + 1, out = y * stride;
+      for (let x = 0; x < stride; x++) {
+        const a = x >= channels ? px[out + x - channels] : 0, up = y ? px[out - stride + x] : 0, c = x >= channels && y ? px[out - stride + x - channels] : 0;
+        let p = a;
+        if (f === 4) { const t = a + up - c, pa = Math.abs(t - a), pb = Math.abs(t - up), pc = Math.abs(t - c); p = pa <= pb && pa <= pc ? a : pb <= pc ? up : c; }
+        px[out + x] = (raw[src + x] + (f === 0 ? 0 : f === 1 ? a : f === 2 ? up : f === 3 ? (a + up) >> 1 : p)) & 255;
+      }
+    }
+    const rgba = new Uint8Array(w * h * 4);
+    for (let k = 0; k < w * h; k++) {
+      const o = k * channels, q = k * 4;
+      if (ctype === 3) {
+        const ix = px[o];
+        if (plte && ix * 3 + 2 < plte.length) { rgba[q] = plte[ix * 3]; rgba[q + 1] = plte[ix * 3 + 1]; rgba[q + 2] = plte[ix * 3 + 2]; }
+        rgba[q + 3] = trns && ix < trns.length ? trns[ix] : 255;
+      } else if (ctype === 0 || ctype === 4) {
+        rgba[q] = rgba[q + 1] = rgba[q + 2] = px[o]; rgba[q + 3] = ctype === 4 ? px[o + 1] : 255;
+      } else {
+        rgba[q] = px[o]; rgba[q + 1] = px[o + 1]; rgba[q + 2] = px[o + 2]; rgba[q + 3] = ctype === 6 ? px[o + 3] : 255;
+      }
+    }
+    return { w, h, rgba };
+  } catch (e) {
+    return null;
+  }
+}
+
+/** RGBA pixels → a PNG file (filter None, deflated with CompressionStream); null without it
+ * @param {number} w @param {number} h @param {Uint8Array} rgba @returns {Promise<Uint8Array | null>} */
+async function pngEncode(w, h, rgba) {
+  if (typeof CompressionStream !== "function") return null;
+  const raw = new Uint8Array((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) raw.set(rgba.subarray(y * w * 4, (y + 1) * w * 4), y * (w * 4 + 1) + 1);
+  const z = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer());
+  const crcTable = pngEncode.table || (pngEncode.table = Array.from({ length: 256 }, (_, n) => {
+    let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0;
+  }));
+  const chunk = (type, body) => {
+    const out = new Uint8Array(12 + body.length), dv = new DataView(out.buffer);
+    dv.setUint32(0, body.length);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(body, 8);
+    let c = 0xffffffff;
+    for (let i = 4; i < 8 + body.length; i++) c = crcTable[(c ^ out[i]) & 255] ^ (c >>> 8);
+    dv.setUint32(8 + body.length, (c ^ 0xffffffff) >>> 0);
+    return out;
+  };
+  const ihdr = new Uint8Array(13), hv = new DataView(ihdr.buffer);
+  hv.setUint32(0, w); hv.setUint32(4, h); ihdr[8] = 8; ihdr[9] = 6;   // 8-bit RGBA, no interlace
+  const parts = [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", ihdr), chunk("IDAT", z), chunk("IEND", new Uint8Array(0))];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  parts.reduce((at, p) => (out.set(p, at), at + p.length), 0);
+  return out;
+}
+
+/**
+ * A custom shape drawn in a colour, as Tableau colours a shape mark: every coloured pixel takes the colour, its
+ * darkness and transparency kept (white and near-white parts – an arrow cut out of a disc – stay white).
+ * @param {Uint8Array} data PNG @param {string} argb @returns {Promise<Uint8Array | null>}
+ */
+async function pngTint(data, argb) {
+  const img = await pngPixels(data);
+  const m = String(argb || "").match(/^(?:FF)?([0-9a-f]{6})$/i);
+  if (!img || !m) return null;
+  const [R, G, B] = [0, 2, 4].map(i => parseInt(m[1].slice(i, i + 2), 16));
+  const { w, h, rgba } = img;
+  for (let k = 0; k < w * h * 4; k += 4) {
+    const r = rgba[k], g = rgba[k + 1], b = rgba[k + 2];
+    if (Math.min(r, g, b) > 225) continue;                       // white stays white
+    rgba[k] = R; rgba[k + 1] = G; rgba[k + 2] = B;
+  }
+  return pngEncode(w, h, rgba);
+}
+
+/**
  * How each image object can be drawn on the grid: "backdrop" (a background behind other objects – not
  * exported, it would cover the cells), "overlay" (an icon on top of a worksheet / text box: floats over
  * that block, host = its id), "tiny" (dividers, spacers) or "block" (a logo with its own zone).
@@ -7173,7 +7484,7 @@ function viewModelHeight(vm) {
   return (vm.showTitle ? 1 : 0) + headerRowSpan(vm) + vm.rows.length + (grouped ? 1 : 0);
 }
 
-function resolveCollisions(zones) {
+function resolveCollisions(zones, clusterOf = null) {
 if (!zones || zones.length === 0) return zones;
 
 // Full row/header/note height a zone actually occupies on the sheet,
@@ -7201,8 +7512,14 @@ for (const [, group] of rowGroups) {
     if (item.gridCol < cursor) item.gridCol = cursor;
     cursor = item.gridCol + item.gridW + COL_GAP;
   }
-  const groupBottom = minRow + Math.max(...group.map(z => getVisualHeight(z))) + ROW_GAP;
-  processedGroups.push({ minRow, items: group, bottom: groupBottom });
+  // blocks level on the dashboard move down together – but only within one top-level layout container: a floating
+  // panel pushed down by its own content does not drag the tiled cards beside it that start on the same row
+  const clusters = new Map();
+  group.forEach(z => { const k = clusterOf ? clusterOf(z) : ""; if (!clusters.has(k)) clusters.set(k, []); clusters.get(k).push(z); });
+  clusters.forEach(items => {
+    const groupBottom = minRow + Math.max(...items.map(z => getVisualHeight(z))) + ROW_GAP;
+    processedGroups.push({ minRow, items, bottom: groupBottom });
+  });
 }
 
 // ── Vertical pushes: a row group moves down as a whole, below every earlier group it overlaps
@@ -7368,7 +7685,7 @@ function writeKPICardStacked(worksheet, vm, originRow, originCol, rangeTracker) 
     const color = plan.markIdx.has(ci) ? plan.colorAt(0) : null;
     const extra = {};
     if (color && plan.enc.applyTo === "fill") extra.fill = color;
-    if (color && plan.enc.applyTo === "font" && !vp.explicitColor) extra.fontColor = color;
+    if (color && plan.enc.applyTo === "font") extra.fontColor = color;   // over the label's own colour, as Tableau
     tfWriteCell(worksheet.getCell(r + k + 1, C + 2), rows[0][ci], vp, extra);
     if (vm.slicerBinding) vm.slicerBinding.bindCell(worksheet.getCell(r + k + 1, C + 2), [rows[0]], ci);
     rangeTracker.update(r + k, C); rangeTracker.update(r + k, C + 1);
@@ -7875,6 +8192,9 @@ const KPI_GUTTER = { style: "medium", color: { argb: "FFFFFFFF" } };
  * @param {(props: Record<string, any>) => Record<string, any>} styled static text props from a run's props
  * @returns {KpiSegment[][]}
  */
+/* Tableau's own insertable fields in a text box / label / title ("<Sheet Name>", "<Page Name>" …) */
+const TF_NAMED_TOKENS = /^(Sheet Name|Workbook Name|Page Name|Page Number|Page Count|All Fields|Full Name|User Name|Current Date|Current Time|Data Source Name|Data Update Time|Data Update Date|Data Source Update Time|Data Source Update Date)$/i;
+
 function formattedLines(runs, token, styled) {
   const full = runs.map(r => r.text).join("");
   const starts = [];
@@ -7893,6 +8213,9 @@ function formattedLines(runs, token, styled) {
   };
   let last = 0;
   for (const m of full.matchAll(/<([^<>]+)>/g)) {
+    // a field is "<[ds].[field]>", "<Parameters.X>" or one of Tableau's named fields; anything else between < and >
+    // is the text itself ("Rojo: <80%  …  Verde: >90%"), left in its runs' colours
+    if (!/^\s*\[/.test(m[1]) && !/^Parameters\./i.test(m[1]) && !TF_NAMED_TOKENS.test(m[1].trim())) continue;
     plain(last, m.index);
     const seg = token(m[1], runs[runAt(m.index + 1)].props);  // the run holding the field name
     if (seg) lines[lines.length - 1].push(seg);
@@ -7986,6 +8309,34 @@ function buildTextCard(zone, layout, model) {
            widthPx, zoneWidthPx: (layout && layout.widthPx) || null };
 }
 
+/** a text that is only a number ("100%", "1,250", "-3.5") → its value and Excel format; null otherwise
+ * @param {string} text @returns {{ value: number, numFmt: string } | null} */
+function numericText(text) {
+  const t = String(text || "").trim();
+  const m = t.match(/^(-?)(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(%?)$/);
+  if (!m) return null;
+  const n = Number(`${m[1]}${m[2].replace(/,/g, "")}${m[3] || ""}`);
+  const value = m[4] ? n / 100 : n;
+  const numFmt = inferExcelNumFmt(t, value);
+  return isFinite(value) && numFmt ? { value, numFmt } : null;
+}
+
+/**
+ * A row of shapes as a text card: one line of the shape's character in the marks' colour, the marks spread over the
+ * zone's width as Tableau spaces them, one row tall.
+ * @param {{ glyph: string, count: number, color: string }} strip @param {any} layout
+ */
+function shapeStripCard(strip, layout) {
+  const sizePt = 9;
+  const hex = String(strip.color || "333333").replace(/^#/, "").slice(-6).toUpperCase();
+  const props = tfMerge(TABLEAU_DEFAULTS.worksheet, { color: "FF" + hex, fontSize: sizePt, hAlign: "center" });
+  const w = (layout && layout.widthPx) || 300, glyphPx = sizePt * 4 / 3 * 0.8, spacePx = sizePt * 4 / 3 * 0.28;
+  const gap = Math.max(1, Math.round((w / strip.count - glyphPx) / spacePx));
+  const text = Array(strip.count).fill(strip.glyph).join(" ".repeat(gap));
+  return { title: null, tiles: [{ lines: [{ segments: [{ text, props }], hAlign: "center", sizePt }] }], background: null,
+           padTop: 0, padBottom: 0, lineHeightsPt: [Math.ceil(sizePt * 1.35 + 2)], rows: 1, widthPx: [w], zoneWidthPx: w };
+}
+
 /** a line's alignment: the pane's Format → Alignment, else the label editor's, else centred
  * @returns {KpiLine} */
 function kpiLine(segments, fmt) {
@@ -8039,16 +8390,26 @@ function writeKpiCard(worksheet, card, vm, originRow, originCol, gridW, rangeTra
       const row = r + card.padTop + i;
       if (c1 > c0) worksheet.mergeCells(row + 1, c0 + 1, row + 1, c1 + 1);
       const cell = worksheet.getCell(row + 1, c0 + 1);
+      // a Color field on a text mark colours its values – over the label's own font colour, as Tableau draws it
+      const encColor = ci => (plan && plan.enc && plan.markIdx.has(ci) && plan.enc.applyTo === "font" ? plan.colorAt(0) : null);
       const only = ln.segments.length === 1 ? ln.segments[0] : null;
+      const numeric = only && only.ci === undefined && !vm ? numericText(only.text) : null;
       if (only && only.ci !== undefined) {                  // a single value: keep the number and its format
-        const color = plan && plan.enc && plan.markIdx.has(only.ci) && plan.enc.applyTo === "font" && !only.props.explicitColor ? plan.colorAt(0) : null;
-        tfWriteCell(cell, vm.rows[0][only.ci], only.props, { fill: card.background || undefined, fontColor: color || undefined });
+        tfWriteCell(cell, vm.rows[0][only.ci], only.props, { fill: card.background || undefined, fontColor: encColor(only.ci) || undefined });
         if (vm.slicerBinding) vm.slicerBinding.bindCell(cell, [vm.rows[0]], only.ci);
+      } else if (numeric) {                                  // a text box that is just a number ("100%"): a number cell
+        tfWriteCell(cell, { value: numeric.value, nativeValue: numeric.value, formattedValue: only.text.trim() },
+                    { ...only.props, numFmt: numeric.numFmt }, { fill: card.background || undefined });
       } else if (ln.segments.length) {
-        cell.value = { richText: ln.segments.map(s => ({ text: textOf(s, vm), font: tfExcelFont(s.props) })) };
+        cell.value = { richText: ln.segments.map(s => {
+          const c = s.ci !== undefined ? encColor(s.ci) : null;
+          return { text: textOf(s, vm), font: tfExcelFont(c ? { ...s.props, color: c } : s.props) };
+        }) };
         if (card.background) cell.fill = tfExcelFill(card.background);
       }
-      cell.alignment = { horizontal: ln.hAlign, vertical: "middle", indent: ln.hAlign === "center" ? 0 : 1, wrapText: false };
+      // a value wider than its cell shows smaller rather than as ##### (Tableau's narrow zones hide it)
+      cell.alignment = { horizontal: ln.hAlign, vertical: "middle", indent: ln.hAlign === "center" ? 0 : 1, wrapText: false,
+                         ...(only && (only.ci !== undefined || numeric) ? { shrinkToFit: true } : {}) };
       // a merged range has one style (ExcelJS): both outer edges go on it, Excel draws only the outline
       if (card.background) cell.border = { ...(k === 0 ? { left: KPI_GUTTER } : {}), ...(k === n - 1 ? { right: KPI_GUTTER } : {}) };
       const xr = worksheet.getRow(row + 1);
@@ -8118,8 +8479,17 @@ function backgroundPlan(zones, dashColor, blocks, canvas, dashPx) {
   const inside = (p, z) => p.x >= z.x && p.x <= z.x + z.w && p.y >= z.y && p.y <= z.y + z.h;
   // a zone in a hidden container is not on the dashboard either
   const shown = z => { for (let q = z, n = 0; q && n < 50; q = zoneById.get(String(q.parent)), n++) if (q.hidden) return false; return true; };
+  // a zone's background fills the box inside its outer padding (margins in px → zone units)
+  const innerBox = z => {
+    const m = z.style && z.style.margin;
+    if (!m) return z;
+    const ux = 100000 / (dashPx.w || 1), uy = 100000 / (dashPx.h || 1);
+    return { ...z, x: z.x + m.l * ux, y: z.y + m.t * uy, w: Math.max(0, z.w - (m.l + m.r) * ux), h: Math.max(0, z.h - (m.t + m.b) * uy) };
+  };
   const coloured = (zones || []).map((z, order) => ({ z, order }))
-    .filter(({ z }) => z.style && z.style.bgColor && !blockZones.has(String(z.id)) && z.w > 0 && z.h > 0 && shown(z));
+    .filter(({ z }) => z.style && z.style.bgColor && !blockZones.has(String(z.id)) && z.w > 0 && z.h > 0 && shown(z))
+    .map(({ z, order }) => ({ z: innerBox(z), order }))
+    .filter(({ z }) => z.w > 0 && z.h > 0);
   const px = z => ({ w: z.w * dashPx.w / 100000, h: z.h * dashPx.h / 100000 });
 
   /** @type {BgLine[]} */
@@ -8394,7 +8764,7 @@ async function refreshChecks(dashboard) {
 const DEFAULT_BACKEND_URL = "";      // production: the hosted Worker URL, e.g. "https://export-to-excel-backend.<account>.workers.dev"
 const EXTENSION_VERSION = "2.2.0";
 /** which build made an export: shown in the Conversion Report and the panel (old cached files are easy to spot) */
-const EXTENSION_BUILD = "2026-11-05 b796ea71";
+const EXTENSION_BUILD = "2026-11-06 363801f2";
 console.info(`[Export to Excel] v${EXTENSION_VERSION} · build ${EXTENSION_BUILD}`);
 /** Links shown with the licence status (leave "" to hide). */
 const PRODUCT_LINKS = { buy: "", help: "" };
@@ -9413,35 +9783,78 @@ function setFormatModelCache(model, fileName) {
  * shows the icon; its fields are only flags for actions, so the export draws the icon, not a table. */
 
 /**
- * The icon a worksheet shows when it is only Shape marks on empty Rows / Columns, without text: the shape
- * the workbook maps its current value to, else its Marks card shape. null = not an icon sheet.
+ * A row of shapes: shape / circle marks with only dimensions on Columns (no axis, no labels, one colour) – Tableau
+ * draws one mark per member side by side (a decorative ◆ ◆ ◆ divider). As one line of that character in the marks'
+ * colour, spread over the zone's width: a table of its members would take a row each.
  * @param {FormatModel | null} model @param {string} sheetName @param {SummaryData} summary
- * @returns {{ shape: string | null } | null} shape: a custom shape ("Zoom Icons/Zoom in.png"); null = one of
- *   Tableau's own shapes (circle, square …), which the export leaves out
+ * @returns {{ glyph: string, count: number, color: string } | null}
+ */
+function tvShapeStrip(model, sheetName, summary) {
+  const sheet = model && model.sheets ? model.sheets[sheetName] : null;
+  if (!sheet || (sheet.rows || []).length || !(sheet.cols || []).length || sheet.cols.some(r => r.type === "qk")) return null;
+  const panes = (sheet.panes || []).filter(p => !p.hidden);
+  if (!panes.length || !panes.every(p => /^(shape|circle|square)$/i.test(p.markClass || ""))) return null;
+  if (panes.some(p => p.labelRuns.length || p.encodings.some(e => /^(text|label|size|color)$/.test(e.channel)))) return null;
+  const n = (summary.data || []).length;
+  if (n < 2 || n > 60) return null;
+  const pane = panes[0];
+  const shape = String(tvPaneRule(pane, "mark", "shape") || "");
+  if (shape && !shape.startsWith(":")) return null;                     // a custom picture: not a character
+  const mark = String(pane.markClass).toLowerCase();
+  const glyph = /diamond/.test(shape) ? "◆" : /triangle/.test(shape) ? "▲" : /star/.test(shape) ? "★" : /plus|cross/.test(shape) ? "✚"
+    : /square/.test(shape) || mark === "square" ? "■" : "●";
+  return { glyph, count: n, color: createSheetFormatter(model, sheetName, [pane]).markColor() };
+}
+
+/**
+ * The icon a worksheet shows when it is only Shape marks on empty Rows / Columns (or on constant axes that only
+ * place one mark – a bridge sheet's check mark), without text: the shape the workbook maps its current value to,
+ * else its Marks card shape; tinted with the Color encoding's colour for that value, as Tableau draws it.
+ * null = not an icon sheet.
+ * @param {FormatModel | null} model @param {string} sheetName @param {SummaryData} summary
+ * @returns {{ shape: string | null, tint?: string } | null} shape: a custom shape ("Zoom Icons/Zoom in.png"); null =
+ *   one of Tableau's own shapes (circle, square …), which the export leaves out; tint: ARGB
  */
 function tvIconSheet(model, sheetName, summary) {
   const sheet = model && model.sheets ? model.sheets[sheetName] : null;
-  if (!sheet || !sheet.panes.length || sheet.rows.length || sheet.cols.length) return null;
+  if (!sheet || !sheet.panes.length) return null;
+  const constAxes = [...sheet.rows, ...sheet.cols].every(r => tvIsConstantRef(model, r));
+  if ((sheet.rows.length || sheet.cols.length) && !(constAxes && (summary.data || []).length <= 1)) return null;
   if (!sheet.panes.every(p => /^shape$/i.test(p.markClass || ""))) return null;
   if (sheet.panes.some(p => p.labelRuns.length || p.encodings.some(e => e.channel === "text" || e.channel === "label"))) return null;
   const pane = sheet.panes[0];
-  let shape = null;
+  let shape = null, row = (summary.data || [])[0] || null;
+  const fmt = createSheetFormatter(model, sheetName);
+  const colOf = ref => (summary.columns || []).findIndex(c => tfSameField(fmt.matchName(c.fieldName), ref));
   // Shape = a field: the shape of the value it has now (the workbook's map, sheet before data source)
   const enc = pane.encodings.find(e => e.channel === "shape");
   if (enc) {
     const styles = [sheet.style, ...Object.values(model.datasourceStyles || {}), model.workbookStyle];
     const def = styles.flatMap(s => (s && s.shapes) || []).find(s => tfSameField(s.field, enc.field));
-    const fmt = createSheetFormatter(model, sheetName);
-    const ci = (summary.columns || []).findIndex(c => tfSameField(fmt.matchName(c.fieldName), enc.field));
+    const ci = colOf(enc.field);
     // the first mark whose value has a shape (the marks of a button sit on one spot)
-    if (def && ci >= 0) shape = (summary.data || []).map(r => def.map[tfBucketKey(tfDvText(r[ci]))]).find(Boolean) || null;
+    if (def && ci >= 0) {
+      row = (summary.data || []).find(r => def.map[tfBucketKey(tfDvText(r[ci]))]) || row;
+      shape = row ? def.map[tfBucketKey(tfDvText(row[ci]))] || null : null;
+    }
   }
   // else the Marks card shape
   if (!shape) {
     const f = ((pane.style && pane.style.rules && pane.style.rules.mark) || []).find(x => x.attr === "shape" && !x.field);
     shape = f ? f.value : null;
   }
-  return { shape: shape && !shape.startsWith(":") ? shape : null };     // ":filled/circle" … = Tableau's own
+  // a Color encoding tints the shape (a green arrow picture drawn red for "Red")
+  let tint;
+  try {
+    const pfmt = createSheetFormatter(model, sheetName, [pane]);
+    const cenc = pfmt.colorEncoding();
+    const ci = cenc && !cenc.continuous ? colOf(cenc.ref) : -1;
+    if (ci >= 0 && row) {
+      const v = tfDvText(row[ci]);
+      tint = (tfBuildColorScale(pfmt, cenc, [v]) || (() => null))(v) || undefined;
+    }
+  } catch (e) { tint = undefined; }
+  return { shape: shape && !shape.startsWith(":") ? shape : null, ...(tint ? { tint } : {}) };   // ":filled/circle" … = Tableau's own
 }
 
 
@@ -10565,7 +10978,7 @@ const FIDELITY = { NATIVE: "High", CONSTRUCTED: "High", APPROXIMATE: "Medium", T
 function chartOutputName(spec) {
   if (spec.conversion && spec.conversion.output) return spec.conversion.output;
   const dir = spec.barDir === "bar" ? "bar" : "column";
-  const grouping = spec.percent ? "100% stacked " : spec.stacked ? "stacked " : "";
+  const grouping = spec.percent ? "100% stacked " : spec.stacked ? "stacked " : spec.overlap ? "overlaid " : "";
   const kinds = [...new Set(spec.series.filter(s => !s.refLine).map(s => s.type || spec.kind))];
   const extras = spec.series.some(s => s.refLine) || (spec.refLines && spec.refLines.length) ? " with reference line" : "";
   switch (spec.kind) {
@@ -11194,10 +11607,11 @@ function dLbls(spec, s, pos, hidden) {
     `${spec.kind === "pie" || spec.kind === "doughnut" ? '<c:showLeaderLines val="1"/>' : ""}</c:dLbls>`;
 }
 
-function markerXml(symbol, color, size) {
+function markerXml(symbol, color, size, fill) {
   if (!symbol || symbol === "none") return `<c:marker><c:symbol val="none"/></c:marker>`;
+  // fill: a ring – that fill inside a thicker border of the colour (a lollipop's head on its bar)
   return `<c:marker><c:symbol val="${symbol}"/><c:size val="${size || 6}"/>` +
-    `<c:spPr>${solid(color, 85000)}${line(color, 9525)}</c:spPr></c:marker>`;
+    `<c:spPr>${fill ? solid(fill, null) + line(color, 25400) : solid(color, 85000) + line(color, 9525)}</c:spPr></c:marker>`;
 }
 
 /* a reference line's stroke: colour with its opacity, width (px), dashes; none when switched off */
@@ -11390,10 +11804,13 @@ function seriesXml(spec, s, k, refs, type, hiddenLabels) {
   if (type === "line") {
     const lineSp = s.line === false ? `<a:ln w="28575"><a:noFill/></a:ln>`
       : `<a:ln w="22225" cap="rnd">${solid(s.color, opacity)}<a:round/></a:ln>`;
-    const symbol = s.marker ? (s.markerSymbol || "circle") : "none";
+    const symbol = s.marker && !s.pointMarkers ? (s.markerSymbol || "circle") : "none";
     const size = s.markerSize || 7;
-    const dpts = s.marker ? pc.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(symbol, c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("") : "";
-    return `<c:ser>${head}<c:spPr>${lineSp}</c:spPr>${markerXml(symbol, s.color, size)}${dpts}` +
+    // pointMarkers: a dot only on some points (Tableau's shape mark where its Shape field picks one), each its colour
+    const dpts = s.pointMarkers
+      ? s.pointMarkers.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(s.markerSymbol || "circle", c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("")
+      : s.marker ? pc.map((c, i) => c ? `<c:dPt><c:idx val="${i}"/>${markerXml(symbol, c, size)}<c:bubble3D val="0"/></c:dPt>` : "").join("") : "";
+    return `<c:ser>${head}<c:spPr>${lineSp}</c:spPr>${markerXml(symbol, s.color, size, s.markerFill)}${dpts}` +
       `${dLbls(spec, s, "t", hiddenLabels)}${catXml(refs.cat, levels, spec.dateAxis, spec.categories.starts)}${valXml("val", r.val, s.values)}<c:smooth val="0"/>${labelRangeXml(s, r)}</c:ser>`;
   }
   if (type === "area") {
@@ -15653,6 +16070,117 @@ function addEveryValueMarks(items, everyValue, fmtModel, legendItems = []) {
  * with two changed – or a slicer / date range, which are not read value by value – these visuals show nothing, rather
  * than numbers Tableau never computed. A filter card the slicers could not adopt becomes such a dropdown too. */
 
+/**
+ * Whether a sheet's numbers depend on one of these parameters: a field it uses (shelves, marks card, filters, Measure
+ * Values) whose calculation – or a calculation that one uses, and so on – reads [Parameters].[name].
+ * ponytail: data source filters and context are not followed (a parameter used only there is missed).
+ * @param {FormatModel} model @param {string} sheetName @param {string[]} names normalised parameter names / captions
+ */
+function sheetUsesParam(model, sheetName, names) {
+  const sheet = model && model.sheets && model.sheets[sheetName];
+  if (!sheet) return false;
+  const norm = x => tfNorm(x).replace(/[^a-z0-9]/g, "");
+  const want = new Set(names);
+  const seen = new Set();
+  const uses = ref => {
+    if (!ref || !ref.name) return false;
+    if (/^parameters$/i.test(ref.ds || "")) return want.has(norm(ref.name)) || want.has(norm((tfFieldInfo(model, ref) || {}).caption || ""));
+    const info = tfFieldInfo(model, ref);
+    const key = `${ref.ds}|${(info && info.name) || ref.name}`.toLowerCase();
+    if (!info || seen.has(key)) return false;
+    seen.add(key);
+    const f = String(info.formulaFull || info.formula || "");
+    for (const m of f.matchAll(/(?:\[([^\]]+)\]\.)?\[([^\]]+)\]/g)) {
+      if (uses({ ds: m[1] || ref.ds, name: m[2] })) return true;
+    }
+    return false;
+  };
+  const refs = [...(sheet.rows || []), ...(sheet.cols || []), ...(sheet.fieldRefs || []), ...(sheet.filterRefs || []),
+                ...(sheet.panes || []).flatMap(p => (p.encodings || []).map(e => e.field)),
+                ...(sheet.measureFilter || []).map(x => tfParseFieldRef(String(x).replace(/^"|"$/g, "")))];
+  return refs.some(uses);
+}
+
+/**
+ * List parameters the dashboard sets – shown as a parameter control, or set by a button sheet (a parameter action) –
+ * as dropdown cards read value by value like a filter's: each value set in Tableau (changeValueAsync takes a list's
+ * alias), the visuals read, the export's value put back. A button's sheet becomes that dropdown, in its place.
+ * Parameters that switch views (zone toggles) are left to the view switches. Live parameters only (this dashboard).
+ * Only the visuals whose calculations use the parameter are read (sheetUsesParam); a sheet with one mark is a bridge
+ * that copies a value on select, not a button.
+ * @param {{ dashboard: any, fmtModel: FormatModel | null, dataWorksheetItems: any[], filterValueItems: any[] }} o
+ * @param {any[]} visuals
+ */
+async function parameterStateCards(o, visuals) {
+  const { dashboard, fmtModel, dataWorksheetItems, filterValueItems } = o;
+  if (!dashboard || typeof dashboard.getParametersAsync !== "function") return [];
+  let params = [];
+  try { params = (await dashboard.getParametersAsync()) || []; } catch (e) { return []; }
+  const norm = x => tfNorm(x).replace(/[^a-z0-9]/g, "");
+  const dashM = fmtModel && fmtModel.dashboards && fmtModel.dashboards[dashboard.name];
+  const toggled = new Set(Object.values((dashM && dashM.toggles) || {}).map(t => norm(t.param)));
+  const out = [];
+  /** a parameter's names as the workbook and the API give them, normalised */
+  const idsOf = q => {
+    const info = fmtModel && Object.values(fmtModel.fields).find(f => f.param && norm(f.caption || f.name) === norm(q.name));
+    return [norm(q.name), info && norm(info.name), q.id && norm(String(q.id).replace(/^\[Parameters\]\./i, ""))].filter(Boolean);
+  };
+  const textOf = dv => (dv ? String(dv.formattedValue ?? dv.value) : null);
+  const listOf = q => (q.allowableValues && String(q.allowableValues.type).toLowerCase() === "list"
+    ? [...new Set((q.allowableValues.allowableValues || []).map(textOf))] : []);
+  for (const p of params) {
+    if (!p || typeof p.changeValueAsync !== "function") continue;
+    const ids = idsOf(p);
+    if (ids.some(i => toggled.has(i))) continue;
+    const choices = listOf(p);
+    const current = textOf(p.currentValue);
+    if (choices.length < 2 || choices.length > FORMAT_CONFIG.filterStatesMaxValues || current === null || !choices.includes(current)) {
+      if (filterValueItems.some(it => it.isParameter && it.param && norm(it.param.name) === norm(p.name)))
+        console.log(`[States] parameter "${p.name}" not read value by value: ${p.allowableValues ? String(p.allowableValues.type) : "no"} domain, ` +
+                    `${choices.length} values (${choices.slice(0, 5).join(", ")}…), current "${current}"`);
+      continue;
+    }
+    // a bridge: a parameter action whose source field is just this parameter ("Bridge Mes = [Mes_TMP]", on a sheet of one
+    // mark) copies it into the parameter the calculations use – Tableau runs it, setting the value through the API does
+    // not: those parameters are set to the same value with it
+    const bridged = ((fmtModel && fmtModel.paramActions) || []).filter(a => (!a.dashboard || a.dashboard === dashboard.name) && a.field).map(a => {
+      const src = tfFieldInfo(fmtModel, tfParseFieldRef(a.field));
+      const m = String((src && (src.formulaFull || src.formula)) || "").trim().match(/^\[Parameters\]\.\[([^\]]+)\]$/);
+      return m && ids.includes(norm(m[1])) ? norm(a.param) : null;
+    }).filter(Boolean);
+    const targets = params.filter(q => q !== p && typeof q.changeValueAsync === "function" && idsOf(q).some(i => bridged.includes(i)))
+      .map(q => ({ param: q, current: textOf(q.currentValue), choices: listOf(q) }));
+    const affects = visuals.filter(it => sheetUsesParam(fmtModel, it.name, [...ids, ...targets.flatMap(t => idsOf(t.param))]));
+    if (!affects.length) continue;
+    let card =filterValueItems.find(it => it.isParameter && it.param && norm(it.param.name) === norm(p.name) && !it.control && !it.paramFields);
+    if (!card) {
+      // a button sheet that sets it: the dropdown takes the button's place
+      const action = ((fmtModel && fmtModel.paramActions) || []).find(a => (!a.dashboard || a.dashboard === dashboard.name) && ids.includes(norm(a.param)) &&
+                                                                        dataWorksheetItems.some(it => it.name === a.worksheet && it.layout &&
+                                                                                                      it.summary && (it.summary.data || []).length >= 2));
+      if (!action) continue;
+      const k = dataWorksheetItems.findIndex(it => it.name === action.worksheet);
+      const button = dataWorksheetItems[k];
+      const a2 = affects.indexOf(button);
+      if (a2 >= 0) affects.splice(a2, 1);
+      if (!affects.length) continue;                             // only the button itself uses it: it stays a button
+      dataWorksheetItems.splice(k, 1);
+      const v = visuals.indexOf(button);
+      if (v >= 0) visuals.splice(v, 1);
+      card = { type: "filterValue", isParameter: true, name: button.name, visualName: p.name, filterName: p.name, values: [current],
+               layout: button.layout, rowCount: 2, fixedGridW: button.fixedGridW, param: { name: p.name, currentValue: p.currentValue }, button: button.name,
+               noTitle: !(button.vm && button.vm.showTitle) || undefined };   // the button's sheet title shown or not
+      filterValueItems.push(card);
+    }
+    out.push({ card, kind: "list", field: undefined, choices, current, on: [], affects, raw: { fieldName: p.name }, param: p,
+               ids: [...ids, ...targets.flatMap(t => idsOf(t.param))], targets });
+    console.log(`[States] parameter "${p.name}": ${choices.length} values, ${affects.length} visual(s) use it` +
+                `${targets.length ? ` (copied into ${targets.map(t => `"${t.param.name}"`).join(", ")} by a parameter action)` : ""}` +
+                `${card.button ? ` (the "${card.button}" button → a dropdown)` : ""}`);
+  }
+  return out;
+}
+
 /** the worksheets' filters, read once per export of a dashboard @param {any[]} sheets */
 function filterStatesReader(sheets) {
   const cache = new Map();
@@ -15722,6 +16250,21 @@ async function addFilterStates(o) {
     const sets = on.filter(ws => affects.some(it => it.name === ws.name));
     cards.push({ card, kind: "list", field, choices, valueOf, current: current === null ? SLICER_ALL : current, on: sets, affects, raw: raw || f });
   }
+  cards.push(...await parameterStateCards(o, visuals));
+  // a gauge's needle drawn by a sheet floated on it: that sheet is read with the visuals its dropdown changes (not bound
+  // itself – it is not exported), the needle's angle for each value worked out from its marks (needleFormula)
+  const needles = dataWorksheetItems.filter(it => it.visualModel && it.visualModel.gauge && it.visualModel.gauge.needleFrom)
+    .map(it => ({ gauge: it.visualModel.gauge, item: dataWorksheetItems.find(x => x.name === it.visualModel.gauge.needleFrom) }))
+    .filter(n => n.item && live.some(ws => ws.name === n.item.name));
+  for (const c of cards.filter(x => x.kind === "list")) {
+    for (const n of needles) {
+      const ws = live.find(w => w.name === n.item.name);
+      const uses = c.param ? sheetUsesParam(o.fmtModel, n.item.name, c.ids) : !!(await hasFilter(ws, c.raw.fieldName));
+      if (!uses || c.affects.includes(n.item)) continue;
+      c.affects.push(n.item);
+      if (!c.param && !c.on.includes(ws)) c.on.push(ws);
+    }
+  }
   const lists = cards.filter(c => c.kind === "list");
   if (!lists.length) return null;
 
@@ -15733,6 +16276,11 @@ async function addFilterStates(o) {
   const budget = FORMAT_CONFIG.filterStatesMaxReads;
   const valueText = v => (v.value !== null && v.value !== undefined ? v.value : v.formattedValue);
   const setTo = async (c, choice) => {
+    if (c.param) {                                             // a parameter's list: its alias / value (and the ones it is copied into)
+      await c.param.changeValueAsync(choice);
+      for (const t of c.targets || []) if (t.choices.includes(choice)) await t.param.changeValueAsync(choice);
+      return true;
+    }
     const dv = choice === SLICER_ALL ? null : c.valueOf(choice);
     if (choice !== SLICER_ALL && !dv) return false;
     await Promise.all(c.on.map(ws => (dv ? ws.applyFilterAsync(c.raw.fieldName, [valueText(dv)], "replace", { isExcludeMode: false })
@@ -15740,6 +16288,12 @@ async function addFilterStates(o) {
     return true;
   };
   const restore = async c => {
+    if (c.param) {
+      const back = (q, v) => (v === null ? Promise.resolve() : q.changeValueAsync(v)).catch(e => console.warn(`[States] parameter "${q.name}" could not be put back: ${e.message}`));
+      await back(c.param, c.current);
+      for (const t of c.targets || []) await back(t.param, t.current);
+      return;
+    }
     const f = c.card.filter;
     await Promise.all(c.on.map(ws => (f.isAllSelected ? ws.clearFilterAsync(c.raw.fieldName)
       : ws.applyFilterAsync(c.raw.fieldName, (f.appliedValues || []).map(valueText), "replace", { isExcludeMode: !!f.isExcludeMode }))
@@ -15879,6 +16433,47 @@ async function addFilterStates(o) {
     it.slicerNote = "follows the dropdowns one at a time: Tableau's own numbers for each value, read at export (two changed at once: empty)";
   }
   return {
+    /** a gauge whose needle a floated sheet draws: the needle's angle as a formula of the dropdowns – Tableau's angle for
+     * each value (from that sheet's marks read then); null when that sheet was not read */
+    needleFormula(gauge) {
+      const n = needles.find(x => x.gauge === gauge);
+      if (!n || !gauge.needle || !lists.some(c => c.affects.includes(n.item))) return null;
+      const exported = gauge.needle.angle;
+      const values = keys.map(key => {
+        if (!lists[Number(key.split("|")[0])].affects.includes(n.item)) return exported;   // that dropdown does not move it
+        const sum = (states.get(key) || new Map()).get(n.item.name);
+        if (!sum) return undefined;
+        const got = gauge.needleOf(layerNeedlePoints(o.fmtModel, n.item.name, sum));
+        return got ? got.angle : null;
+      });
+      if (values.some(v => v === undefined)) return null;
+      const r = slot++;
+      values.forEach((v, i) => { if (v !== null) put(r + 1, i + 2, v); });
+      put(r + 1, 1, `${n.item.name} (needle angle)`);
+      const look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${K},${keyRow},0))`;
+      // two dropdowns changed at once (no state Tableau computed): the export's angle
+      return `IF(${K}="=",${exported},IFERROR(IF(${look}="",${exported},${look}),${exported}))`;
+    },
+    /** the needle's hover name ("Gauge - NOI Real vs Ppto: -37434.4%") as a formula of the dropdowns: Tableau's tooltip
+     * value for each value, read with the needle; null when that sheet was not read */
+    needleTipFormula(gauge) {
+      const n = needles.find(x => x.gauge === gauge), tip = gauge.needleTip;
+      if (!n || !tip || !lists.some(c => c.affects.includes(n.item))) return null;
+      const values = keys.map(key => {
+        if (!lists[Number(key.split("|")[0])].affects.includes(n.item)) return tip.value;
+        const sum = (states.get(key) || new Map()).get(n.item.name);
+        if (!sum) return undefined;
+        const t = layerTooltip(o.fmtModel, n.item.name, sum);
+        return t ? t.value : null;
+      });
+      if (values.some(v => v === undefined)) return null;
+      const r = slot++;
+      values.forEach((v, i) => { if (v !== null) put(r + 1, i + 2, v); });
+      put(r + 1, 1, `${n.item.name} (tooltip)`);
+      const look = `INDEX(${cellRef(name, 1, r, keys.length, r)},MATCH(${K},${keyRow},0))`;
+      const value = `IF(${K}="=",${tip.value},IFERROR(IF(${look}="",${tip.value},${look}),${tip.value}))`;
+      return `${xlText(`${tip.caption}: `)}&TEXT(${value},${xlText(tip.numFmt)})`;
+    },
     // the controls are written now: the count of those that differ from the export, and the state the one that does makes
     finish() {
       const flags = [], parts = [];
@@ -16136,8 +16731,10 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       catch (err) { console.warn("[Every value] not read:", err.message); }
     }
 
-    /** @type {{ name: string, shape: string, layout: any }[]} button / icon sheets, drawn as their icon */
+    /** @type {{ name: string, shape: string, layout: any, tint?: string }[]} button / icon sheets, drawn as their icon */
     const iconSheets = [];
+    /** @type {ExportItem[]} rows of shapes, drawn as a line of text */
+    const stripItems = [];
     /** @type {ExportItem[]} */
     const filterValueItems = [];
     /** @type {ExportItem[]} */
@@ -16145,6 +16742,8 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     const visualStatuses = [];
     /** sheets drawn inside a donut's hole (its centre text): not exported as blocks of their own */
     const pieCentreSheets = new Set();
+    /** sheets floated on a gauge that drew its needle / centre dot → what they became */
+    const gaugeLayerSheets = new Map();
     /** @type {ExportItem[]} colour legends of pies, drawn at their dashboard position */
     const pieLegendItems = [];
     /** @type {{ name: string, reason: string }[]} worksheets not exported, and why (conversion report) */
@@ -16202,10 +16801,19 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       const layout = layoutMap.get(sheet.name);
       const visualName = (layout && layout.displayName) ? layout.displayName : sheet.name;
 
+      // a row of shapes (◆ ◆ ◆ dividers): one line of that character, not a table of its members
+      const strip = fmtModel && layout ? tvShapeStrip(fmtModel, sheet.name, summaryData) : null;
+      if (strip) {
+        const card = shapeStripCard(strip, layout);
+        stripItems.push({ type: "text", name: `strip:${sheet.name}`, visualName: sheet.name, layout, textCard: card, rowCount: card.rows,
+                          columns: [], strip: true, fixedGridW: layout.widthPx ? Math.max(1, layout.gridRight - layout.gridCol) : null });
+        console.log(`[Shapes] ${sheet.name}: a row of ${strip.count} ${strip.glyph}`);
+        continue;
+      }
       // a button / icon sheet (a custom shape on empty shelves): drawn as its icon, not as a table of its flags
       const icon = fmtModel ? tvIconSheet(fmtModel, sheet.name, summaryData) : null;
       if (icon) {
-        if (icon.shape && layout) iconSheets.push({ name: sheet.name, shape: icon.shape, layout });
+        if (icon.shape && layout) iconSheets.push({ name: sheet.name, shape: icon.shape, layout, tint: icon.tint });
         else {
           console.log(`[Icons] ${sheet.name}: a Tableau shape – not exported`);
           skipped.push({ name: sheet.name, reason: "a button / icon drawn with one of Tableau's built-in shapes" });
@@ -16284,6 +16892,17 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
             ((fmtModel.sheets[sheet.name] || {}).panes || []).some(p => /^polygon$/i.test(p.markClass || ""))) {
           const gauge = buildMapGaugeModel(fmtModel, sheet.name, summaryData);
           if (gauge) { visualModel.gauge = gauge; renderDecision = VISUAL_RENDERERS.chart; }
+          // its needle / centre dot drawn by sheets floated on it: taken into the gauge, not exported again
+          if (gauge && !gauge.needle) {
+            const layers = gaugeLayers(fmtModel, dashboard.name, sheet.name,
+                                       name => (allSheetsData.find(x => x.sheet.name === name) || { data: null }).data);
+            if (layers.needle && gauge.withNeedle(layers.needle.pts, layers.needle.color)) {
+              gaugeLayerSheets.set(layers.needle.name, "The gauge's needle");
+              gauge.needleFrom = layers.needle.name;
+              gauge.needleTip = layers.needle.tip || null;             // its tooltip: the needle slice's hover name
+              layers.dots.forEach(n => gaugeLayerSheets.set(n, "The gauge's centre dot"));
+            }
+          }
         }
         if (renderDecision.renderer === "excel-chart" && !visualModel.pie && !visualModel.gauge) {
           try {
@@ -16662,7 +17281,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     if (everyValue && slicers && slicers.active) addEveryValueMarks(dataWorksheetItems, everyValue, fmtModel, pieLegendItems);
     // ── visuals the slicer formulas cannot rebuild: Tableau's own numbers for each dropdown value (read now, in Tableau)
     const filterStates = FORMAT_CONFIG.filterStates && fmtModel
-      ? await addFilterStates({ workbook, sheetName, sheets, dataWorksheetItems, filterValueItems, slicers }) : null;
+      ? await addFilterStates({ workbook, sheetName, sheets, dataWorksheetItems, filterValueItems, slicers, dashboard, fmtModel }) : null;
 
     // Tableau's number + trend tile: a chart in the zone right under / over a KPI card, same position and
     // width, takes the card's columns so the two line up as one card
@@ -16681,7 +17300,9 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     const headerZoneIds = new Set(dataWorksheetItems.flatMap(it => it.vm ? it.vm.headerZoneIds : []));   // already table headers
     /** @type {ExportItem[]} */
     const textItems = [];
-    (dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "text" && o.isVisible !== false).forEach(o => {
+    // (a box squeezed under a few px – a parked note – is not on the dashboard, as for sheets and images)
+    (dashboard.objects || []).filter(o => OBJECT_KIND[o.type] === "text" && o.isVisible !== false &&
+                                          !(o.size && (o.size.width < MIN_IMAGE_PX || o.size.height < MIN_IMAGE_PX))).forEach(o => {
       const zone = dashZones.find(z => z.type === "text" && String(z.id) === String(o.id));
       const keep = coveredTexts.get(String(o.id));
       if (!zone || zoneHidden(zone) || headerZoneIds.has(zone.id) || keep === 0) return;
@@ -16702,6 +17323,7 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       textItems.push({ type: "text", name: `text:${o.id}`, visualName: tfZoneText(zone), layout, textCard: card,
         rowCount: card.rows, columns: [], fixedGridW: layout && layout.widthPx ? Math.max(1, layout.gridRight - layout.gridCol) : null });
     });
+    textItems.push(...stripItems);
     if (textItems.length) console.log(`[Text] ${textItems.length} dashboard text box(es)`);
 
     // ── dashboard images (logos, icons) from the files packaged in the .twbx: a logo in its own zone is
@@ -16713,11 +17335,25 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
     const imageItems = [];
     /** @type {(ImageBlock & { host: string, xPx: number, yPx: number })[]} */
     const overlayImages = [];
+    // a background picture (a coloured panel / card behind other objects) becomes its colour behind the cells: the
+    // background pass below paints a zone with a bgColor under the blocks inside it
+    /** @type {{ name: string, kind: string, output: string }[]} */
+    const backdropObjects = [];
+    for (const o of imageObjects) {
+      const zone = dashZones.find(z => z.type === "bitmap" && String(z.id) === String(o.id));
+      if (imageKinds.get(String(o.id)).kind !== "backdrop" || !zone || !zone.param || zoneHidden(zone) || (zone.style && zone.style.bgColor && !zone.style.fromImage)) continue;
+      const file = workbookImages[zone.param];
+      const color = file ? await pngDominantColor(file.data) : null;
+      if (!color) continue;
+      zone.style = { ...(zone.style || {}), bgColor: color, fromImage: true };   // the model is reused by the next export
+      backdropObjects.push({ name: zone.param, kind: "Background image", output: `Cell fill #${color.slice(2)}` });
+      console.log(`[Images] ${zone.param}: background – cells filled #${color.slice(2)}`);
+    }
     imageObjects.forEach(o => {
       const cls = imageKinds.get(String(o.id));
       const zone = dashZones.find(z => z.type === "bitmap" && String(z.id) === String(o.id));
       if (!zone || !zone.param || zoneHidden(zone)) return;
-      if (cls.kind === "backdrop" || cls.kind === "tiny") { console.log(`[Images] ${zone.param}: ${cls.kind === "tiny" ? "divider" : "background"} – not exported`); return; }
+      if (cls.kind === "backdrop" || cls.kind === "tiny") { if (cls.kind === "tiny" || !(zone.style && zone.style.bgColor)) console.log(`[Images] ${zone.param}: ${cls.kind === "tiny" ? "divider" : "background"} – not exported`); return; }
       const file = workbookImages[zone.param];
       if (!file) { console.warn(`[Images] ${zone.param} is not in the loaded workbook – load the .twbx to export it`); return; }
       const info = imageInfo(file.data, zone.param);
@@ -16732,21 +17368,23 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
         fixedGridW: layout.widthPx ? Math.max(1, layout.gridRight - layout.gridCol) : null });
     });
     // icon sheets: the shape centred in the sheet's zone at about Tableau's mark size
-    iconSheets.forEach(({ name, shape, layout }) => {
-      const file = workbookImages["shape:" + shape];
-      if (!file) { console.warn(`[Icons] ${name}: shape "${shape}" not in the loaded workbook`); return; }
+    for (const { name, shape, layout, tint } of iconSheets) {
+      let file = workbookImages["shape:" + shape];
+      if (!file) { console.warn(`[Icons] ${name}: shape "${shape}" not in the loaded workbook`); continue; }
+      // the Color encoding's colour over the picture, as Tableau draws a custom shape
+      if (tint) { const t = await pngTint(file.data, tint); if (t) file = { ...file, data: t }; }
       const info = imageInfo(file.data, shape);
       const w = layout.widthPx || 40, h = layout.heightPx || 40;
       const box = Math.min(28, Math.max(12, Math.round(Math.min(w, h) * 0.5)));
-      if (!info.type) return;
+      if (!info.type) continue;
       imageItems.push({ type: "image", name, visualName: name, layout, columns: [],
         image: { file, info, zone: { param: shape, scaled: true, centered: true }, url: null, widthPx: box, heightPx: box },
         rowCount: Math.max(1, Math.round(h / EXCEL_ROW_PX)),
         fixedGridW: layout.widthPx ? Math.max(1, layout.gridRight - layout.gridCol) : null });
-    });
+    }
     if (imageItems.length || overlayImages.length) console.log(`[Images] ${imageItems.length + overlayImages.length} image(s)`);
 
-    const allItems = [...filterValueItems, ...dataWorksheetItems.filter(it => !pieCentreSheets.has(it.name)),
+    const allItems = [...filterValueItems, ...dataWorksheetItems.filter(it => !pieCentreSheets.has(it.name) && !gaugeLayerSheets.has(it.name)),
                       ...textItems, ...imageItems, ...pieLegendItems];
 
     if (allItems.length === 0) {
@@ -16830,7 +17468,14 @@ async function writeDashboardSheet(workbook, sheetName, target, ctx) {
       const band = bandAt.get(it.gridRow);
       if (band && band > (it.actionBand || 0)) { it.allocatedRows += band - (it.actionBand || 0); it.actionBand = band; }
     });
-    resolveCollisions(placedItems);
+    // an item's top-level layout container (the zone with no parent above its zone): blocks move level only within one
+    const zoneParent = new Map(dashZones.map(z => [String(z.id), z.parent === undefined ? null : String(z.parent)]));
+    const topZoneOf = it => {
+      let id = it.layout && it.layout.id !== undefined ? String(it.layout.id) : null;
+      for (let n = 0; id && zoneParent.get(id) && n < 50; n++) id = zoneParent.get(id);
+      return id || "";
+    };
+    resolveCollisions(placedItems, topZoneOf);
 
 // SNAP-OUT-OF-GROUPED-ROWS PASS
 // Excel hides entire physical rows, not per-column cells, so a long table's collapsed rows would
@@ -16863,7 +17508,7 @@ while (FORMAT_CONFIG.groupOverflowRows && snapChanged && snapPass < MAX_SNAP_PAS
   }
   // a table moved below another's collapsed rows can now sit on what was under it: everything below moves
   // down with it (resolveCollisions only ever moves items down, and only where they really overlap)
-  if (snapChanged) resolveCollisions(placedItems);
+  if (snapChanged) resolveCollisions(placedItems, topZoneOf);
 }
 setTableVisibleRows(placedItems);
 
@@ -17007,7 +17652,13 @@ setTableVisibleRows(placedItems);
           writeParamNumber(worksheet, ctl);
           return sheetRef(worksheet.name, `$${getExcelColumnName(ctl.gridCol)}$${ctl.gridRow + (ctl.noTitle ? 0 : 1) + 1}`);
         };
-        const live = gauge.live ? gauge.live(paramCell) : null;
+        const paramLive = gauge.live ? gauge.live(paramCell) : null;
+        let live = paramLive;
+        // a needle a floated sheet draws: Tableau's angle for each dropdown value (read at export)
+        const stateNeedle = filterStates && gauge.needleFrom && !(live && live.needle) ? filterStates.needleFormula(gauge) : null;
+        if (stateNeedle) live = { ends: null, first: null, ...(live || {}), needle: stateNeedle };
+        const stateTip = filterStates && gauge.needleTip ? filterStates.needleTipFormula(gauge) : null;
+        if (stateTip) live = { ends: null, first: null, needle: null, ...(live || {}), needleTip: stateTip };
         gauge.liveDial = !!(live && live.ends);
         const data = writeGaugeData(chartDataSheetOf(), chartData.row + 1, gauge, item.name, live);
         chartData.row = data.nextRow - 1;
@@ -17015,8 +17666,10 @@ setTableVisibleRows(placedItems);
         reserveGraphicBlock(item);
         item.visualModel.status = "success";
         item.visualModel.statusReason = "Excel gauge (doughnut dial + pie needle) rebuilt from the workbook's calculations" +
-          (live ? ` – its ${[live.ends && "dial", live.needle && "needle"].filter(Boolean).join(" and ")} follow the parameter cells`
-            : " – fixed angles: no number parameter shown on the dashboard moves its dial or needle");
+          (paramLive ? ` – its ${[paramLive.ends && "dial", paramLive.needle && "needle"].filter(Boolean).join(" and ")} follow the parameter cells`
+            : " – fixed angles: no number parameter shown on the dashboard moves its dial or needle") +
+          (gauge.needleFrom ? `; its needle is the "${gauge.needleFrom}" sheet floated on it` +
+            (stateNeedle ? ", turning with the dropdowns (Tableau's angle for each value, read at export)" : ", at its export position") : "");
         if (status) { status.status = "success"; status.reason = item.visualModel.statusReason; }
         continue;
       }
@@ -17500,18 +18153,22 @@ setTableVisibleRows(placedItems);
 
     // the Conversion Report's part for this dashboard (written once for all dashboards by exportToExcel)
     const objects = [
-      ...textItems.map(it => ({ name: String(it.visualName || "").slice(0, 60) || it.name, kind: "Text box", output: "Cells, with Tableau's fonts" })),
+      ...textItems.map(it => (it.strip ? { name: it.visualName, kind: "Row of shapes (worksheet)", output: "One line of its shape character, in the marks' colour" }
+        : { name: String(it.visualName || "").slice(0, 60) || it.name, kind: "Text box", output: "Cells, with Tableau's fonts" })),
       ...imageItems.map(it => ({ name: it.visualName, kind: iconSheets.some(s => s.name === it.name) ? "Button / icon sheet" : "Image",
                                  output: "Picture" })),
+      ...backdropObjects,
       ...pieLegendItems.map(it => ({ name: it.visualName, kind: "Colour legend", output: "Cells: a colour key per item" })),
       ...filterValueItems.map(it => ({ name: it.filterName, kind: it.isParameter ? "Parameter control" : "Filter card",
-                                       output: it.isParameter ? (it.paramFields ? "Date dropdowns: the visuals follow them" : it.dateOnly ? "Date dropdowns (no visual on this sheet uses it)" : it.param && it.param.followed ? "Cells: its value (the gauge follows it)" : "Cells: its value")
+                                       output: it.isParameter ? (it.control ? `Dropdown cell${it.button ? ` (in place of the "${it.button}" button)` : ""}: the visuals that use it show Tableau's numbers for each value`
+                                         : it.paramFields ? "Date dropdowns: the visuals follow them" : it.dateOnly ? "Date dropdowns (no visual on this sheet uses it)" : it.param && it.param.followed ? "Cells: its value (the gauge follows it)" : "Cells: its value")
                                          : it.slicer ? "Excel slicer (its selection as in Tableau)"
                                          : it.control ? controlOutput(it.control.field)
                                          : "Cells: the selected values" })),
       ...actionSlicers.map(a => ({ name: a.caption, kind: "Filter action",
                                    output: `Excel slicer above ${a.source}, filtering it and ${a.field.targets.size - 1} other sheet(s)` })),
-      ...[...pieCentreSheets].map(name => ({ name, kind: "Worksheet in a donut's hole", output: "The donut's centre text" }))
+      ...[...pieCentreSheets].map(name => ({ name, kind: "Worksheet in a donut's hole", output: "The donut's centre text" })),
+      ...[...gaugeLayerSheets].map(([name, output]) => ({ name, kind: "Worksheet layered on a gauge", output }))
     ];
     const report = {
       dashboard: dashboardName, workbookFile: formatModelFileName(), visuals: reportVisuals, objects, skipped,
@@ -17562,7 +18219,10 @@ setTableVisibleRows(placedItems);
         let w = 0, h = 0;
         for (let c = item.gridCol; c < item.gridCol + item.gridW; c++) w += colPx(c);
         for (let r = top; r < item.gridRow + item.allocatedRows; r++) h += rowPx(r);
-        const bg = (item.vm.fmt.tableBackground() || "FFFFFFFF").slice(2);
+        // a see-through sheet: the colour of the cells under it (a backdrop / container fill), else white
+        const under = worksheet.getCell(top + 1, item.gridCol + 1).fill;
+        const underArgb = under && under.type === "pattern" && under.pattern === "solid" && under.fgColor && under.fgColor.argb;
+        const bg = (item.vm.fmt.tableBackground() || underArgb || "FFFFFFFF").slice(2);
         const link = `#'${worksheet.name.replace(/'/g, "''")}'!${worksheet.getCell(top + 1, item.gridCol + 1).address}`;
         (gauge ? buildGaugeCharts(item.visualModel.gauge, { w, h }, panes, { name: item.visualName || item.name, bg })
                : buildPieCharts(pie || item.visualModel.pie, { w, h }, panes, { name: item.visualName || item.name, bg, link })).forEach(c => {

@@ -23,6 +23,8 @@ const GAUGE = path.join(DIR, "Gauge Charts.twbx");
 const skipGauge = has(GAUGE) ? false : "TFX_WORKBOOKS has no Gauge Charts.twbx";
 const TEMPLATE = path.join(DIR, "Gauge Chart Template.twbx");
 const skipTemplate = has(TEMPLATE) ? false : "TFX_WORKBOOKS has no Gauge Chart Template.twbx";
+const NOI = path.join(DIR, "NOI Fake.twbx");
+const skipNoi = has(NOI) ? false : "TFX_WORKBOOKS has no NOI Fake.twbx";
 
 /** the workbook exported (one dashboard, or ALL) → { log, file } */
 async function exportOf(twbx, dashboard, env, name) {
@@ -87,6 +89,58 @@ test("Gauge Chart Template: a map gauge's dial and needle are formulas of its pa
   // the parameter cells are numbers in Tableau's format, not text
   const dash = parts["xl/worksheets/sheet1.xml"];
   assert.match(dash, /<c r="B7" [^>]*><v>0\.4<\/v>/);
+});
+
+test("NOI Executive Console: layered gauge needles, backdrop fills, lollipops, overlaid bars, a button as a dropdown", { skip: skipNoi }, async () => {
+  // its data is a .hyper extract: the summary rows of the sheets checked here, made up
+  const dv = (v, f) => ({ value: v, nativeValue: v, formattedValue: f === undefined ? String(v) : f });
+  const colsOf = (names, types) => names.map((n, i) => ({ fieldName: n, dataType: types[i], index: i }));
+  const rad = d => d * Math.PI / 180;
+  const dial = [];
+  [["Rojo", -120, 60], ["Amarillo", 60, 80], ["Verde", 80, 120]].forEach(([name, a0, a1], id) => {
+    const pts = [];
+    for (let a = a0; a <= a1 + 1e-9; a += 2) pts.push([Math.sin(rad(a)), Math.cos(rad(a))]);
+    for (let a = a1; a >= a0 - 1e-9; a -= 2) pts.push([0.75 * Math.sin(rad(a)), 0.75 * Math.cos(rad(a))]);
+    pts.forEach((p, k) => dial.push([dv(name), dv(id + 1), dv(k + 1), dv(p[0]), dv(p[1])]));
+  });
+  // a needle: base left, tip (0.9 R), base right – at deg clockwise from 12
+  const needle = deg => { const t = rad(deg), d = [Math.sin(t), Math.cos(t)], q = [Math.cos(t), -Math.sin(t)];
+    return [[q[0] * 0.054, q[1] * 0.054], [d[0] * 0.9, d[1] * 0.9], [-q[0] * 0.054, -q[1] * 0.054]].map((p, k) => [dv(1), dv(k + 1), dv(p[0]), dv(p[1])]); };
+  const needleCols = colsOf(["ID", "Path Aguja", "AGG(X Aguja)", "AGG(Y Aguja)"], ["integer", "integer", "float", "float"]);
+  const months = ["Jan 24", "Feb 24", "Mar 24"];
+  const ive = months.flatMap((m, k) => [[dv(m), dv(m), dv("General - Real Act Seleccionado"), dv(0.4 + k / 10), dv(0.4 + k / 10)],
+                                        [dv(m), dv(m), dv("MIN(0)"), dv(0), dv(0.4 + k / 10)]]);
+  const proj = ["City Walk", "Explanada Pachuca"].flatMap((p, k) => [[dv(p), dv("Gauge - One"), dv(1), dv(0)],
+    [dv(p), dv("Gauge - Dynamic Project Chooser Line"), dv([0.9, 0.2][k]), dv(0)]]);
+  const given = tempXlsx("noi-summary.json");
+  fs.writeFileSync(given, JSON.stringify({
+    "Gauge Original NOI (2)": { columns: colsOf(["Segment Color", "Segment ID", "Path Order", "SUM(X)", "SUM(Y)"], ["string", "integer", "integer", "float", "float"]), data: dial },
+    "Needle NOI Total NOI": { columns: needleCols, data: needle(30) },
+    "Needle NOI Total NOI|Mensual / Acumulado=Acumulado": { columns: needleCols, data: needle(-60) },
+    "Needle NOI Bolita NOI": { columns: colsOf(["MIN(Bolita)"], ["float"]), data: [[dv(0)]] },
+    "Gauge Valor IvE": { columns: colsOf(["MY(Date)", "General - MY Axis", "Measure Names", "Measure Values", "AGG(General - Real Act Seleccionado (G))"], ["string", "string", "string", "float", "float"]), data: ive },
+    "Gauge Proyectos Centros Comerciales A": { columns: colsOf([" Proyecto", "Measure Names", "Measure Values", "AGG(MIN(0))"], ["string", "string", "float", "float"]), data: proj }
+  }));
+  const { log, file } = await exportOf(NOI, "Executive Console", { SUMMARY: given }, "noi.xlsx");
+  // the Mensual / Acumulado button → a dropdown; only the visuals whose calculations use the parameter are read
+  assert.match(log, /\[States\] parameter "Mensual \/ Acumulado": 2 values, \d+ visual\(s\) use it \(the "Buton A" button → a dropdown\)/);
+  assert.doesNotMatch(log, /"PUENTE Param" button/, "a one-mark bridge sheet is not a button");
+  const parts = await xmlParts(file.zip);
+  const report = file.text.join("\n");
+  const sheetXml = n => parts[`xl/worksheets/sheet${file.sheets.indexOf(n) + 1}.xml`].replace(/&apos;/g, "'").replace(/&quot;/g, '"');
+  // the needle and the dot sheets are part of the gauge; the needle at 30° (150° from the dial's start at -120°) and
+  // at -60° for Acumulado – Tableau's angles per value on the States sheet
+  assert.match(report, /Needle NOI Total NOI.*Worksheet layered on a gauge.*The gauge's needle/);
+  assert.match(report, /Needle NOI Bolita NOI.*Worksheet layered on a gauge.*The gauge's centre dot/);
+  const states = sheetXml("States Executive Console");
+  assert.match(states, /<row r="(\d+)"[^>]*>(?:(?!<\/row>).)*<v>-59\.99\d*<\/v>(?:(?!<\/row>).)*<v>29\.99\d*<\/v>/, "the needle's angle per value: one row");
+  assert.match(sheetXml("Chart Data"), /<f>MAX\(0,MAX\(0,MIN\([^<]*'States Executive Console'!\$A\$2[^<]*<\/f><v>149\.2<\/v>/);
+  // the orange panel image: its colour behind the cells
+  assert.match(report, /Image\/Backgrounder\.png.*Background image.*Cell fill #FBB05C/);
+  assert.match(parts["xl/styles.xml"], /rgb="FFFBB05C"/);
+  // lollipops: thin bars + dots on one scale; the project bars: track and value overlaid, not stacked
+  assert.match(report, /Gauge Valor IvE.*Column chart \(thin bars\) with a dot on each/);
+  assert.match(report, /Gauge Proyectos Centros Comerciales A.*Overlaid bar chart/);
 });
 
 test("Ecommerce exported at Channel = Website: the pie gets the other channels", { skip: skipEcom }, async () => {
